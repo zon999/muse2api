@@ -235,6 +235,8 @@ curl -X POST "http://localhost:18610/v1/images/generations" \
   排队中的任务直接取消；生成中的任务会点击 Muse 的停止按钮结束会话并立即释放账号，
   任务状态变为 `cancelled`。已结束的任务返回 409。
 
+- **多张参考图**：生图任务与视频任务都支持 `"reference_images": ["data:image/png;base64,...", "https://..."]`（最多 6 张，合计不超过 8MB），会与 `reference_image` / `image` / `images` / `image_url` 合并去重后逐张上传。
+
 - **统一查询**：`GET /v1/tasks/{id}` 可查询任意生图/生视频任务，返回结构与各自的查询接口相同。
 
 ---

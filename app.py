@@ -451,6 +451,7 @@ class ImageRequest(BaseModel):
     image: Any = None
     images: list | None = None
     reference_image: str | None = None
+    reference_images: list | None = None
     async_: bool = Field(False, alias="async")
 
 
@@ -466,6 +467,7 @@ class VideoRequest(BaseModel):
     image: Any = None
     image_url: Any = None
     reference_image: str | None = None
+    reference_images: list | None = None
 
 
 class ChatMessage(BaseModel):
@@ -521,9 +523,37 @@ class AccountPatch(BaseModel):
     enabled: bool | None = None
 
 
+# ------------------------- 参考图 -------------------------
+def _ref_value(item) -> str:
+    """单个参考图条目：字符串，或 {url} / {b64_json} / {image_url: str|{url}}。"""
+    if isinstance(item, dict):
+        nested = item.get("image_url")
+        if isinstance(nested, dict):
+            nested = nested.get("url")
+        item = item.get("url") or item.get("b64_json") or nested
+    return item.strip() if isinstance(item, str) else ""
+
+
+def collect_reference_images(*sources) -> list[str]:
+    """合并请求里各种参考图字段（去重、保序），并校验张数与内联数据大小。"""
+    refs: list[str] = []
+    for src in sources:
+        for item in (src if isinstance(src, list) else [src]):
+            v = _ref_value(item)
+            if v and v not in refs:
+                refs.append(v)
+    if len(refs) > MuseEngine.MAX_REFERENCE_IMAGES:
+        raise HTTPException(400, f"参考图最多 {MuseEngine.MAX_REFERENCE_IMAGES} 张")
+    inline = sum(len(r.split(",", 1)[-1]) * 3 // 4 for r in refs
+                 if not r.startswith(("http://", "https://")))
+    if inline > MuseEngine.MAX_REFERENCE_BYTES:
+        raise HTTPException(400, "参考图总大小超过 8MB")
+    return refs
+
+
 # ------------------------- 提示词构造 -------------------------
 def build_image_prompt(r: ImageRequest) -> str:
-    has_ref = bool(r.reference_image or r.image or r.images)
+    has_ref = bool(r.reference_image or r.image or r.images or r.reference_images)
     if has_ref:
         parts = [f"基于我本次上传附带的参考图片进行生图/编辑：{r.prompt.strip()}"]
     else:
@@ -753,7 +783,7 @@ def build_video_prompt(r: VideoRequest) -> str:
     ar = (r.aspect_ratio or "").strip().lower()
     sz = (r.size or "").strip().lower()
     dur = r.duration or 6
-    has_ref = bool(r.reference_image or r.image or r.image_url)
+    has_ref = bool(r.reference_image or r.image or r.image_url or r.reference_images)
 
     is_vertical = any(k in ar or k in sz for k in ("9:16", "9/16", "portrait", "竖屏", "720x1280", "1080x1920"))
 
@@ -882,7 +912,7 @@ def _pos(v) -> bool:
 
 def _run_generation(prompt: str, kind: str, timeout: int,
                     account_id: str | None = None, on_progress=None,
-                    reference_image: str | None = None,
+                    reference_image: str | list | None = None,
                     on_acquired=None, stop_event=None) -> tuple[dict, str | None]:
     # Browser ownership covers account selection, retry and cleanup, not just generate().
     deadline = time.monotonic() + max(1, timeout)
@@ -909,7 +939,7 @@ def _run_generation(prompt: str, kind: str, timeout: int,
 
 def _run_generation_locked(prompt: str, kind: str, timeout: int,
                     account_id: str | None = None, on_progress=None,
-                    reference_image: str | None = None, deadline=None,
+                    reference_image: str | list | None = None, deadline=None,
                     stop_event=None) -> tuple[dict, str | None]:
     remaining_wait = int(deadline - time.monotonic()) if deadline is not None else timeout
     preferred_id = getattr(engine, "current_acc_id", None)
@@ -1022,7 +1052,7 @@ def _image_response(req: ImageRequest, res: dict) -> dict:
     return {"created": int(time.time()), "data": [item]}
 
 
-def _queue_image(req: ImageRequest, prompt: str, reference_image: str | None,
+def _queue_image(req: ImageRequest, prompt: str, reference_image: list | None,
                  idempotency_key: str | None = None):
     """Opt-in polling avoids reverse-proxy timeouts; no generation is repeated by polling."""
     if idempotency_key and len(idempotency_key) > 256:
@@ -1086,13 +1116,8 @@ def _queue_image(req: ImageRequest, prompt: str, reference_image: str | None,
 @app.post("/v1/images/tasks")
 def create_image_task(req: ImageRequest,
                       idempotency_key: str | None = Header(default=None), _=Depends(auth)):
-    ref_img = req.reference_image or req.image
-    if isinstance(ref_img, dict):
-        ref_img = ref_img.get("url") or ref_img.get("b64_json")
-    if not ref_img and req.images:
-        first = req.images[0]
-        ref_img = first.get("image_url") or first.get("url") if isinstance(first, dict) else first
-    return _queue_image(req, build_image_prompt(req), ref_img, idempotency_key)
+    refs = collect_reference_images(req.reference_images, req.reference_image, req.image, req.images)
+    return _queue_image(req, build_image_prompt(req), refs or None, idempotency_key)
 
 
 @app.get("/v1/images/tasks/{task_id}")
@@ -1110,12 +1135,8 @@ def get_image_task(task_id: str, _=Depends(auth)):
 
 @app.post("/v1/images/generations")
 async def images_generations(req: ImageRequest, _=Depends(auth)):
-    ref_img = req.reference_image or req.image
-    if isinstance(ref_img, dict):
-        ref_img = ref_img.get("url") or ref_img.get("b64_json")
-    if not ref_img and req.images and isinstance(req.images, list):
-        first = req.images[0]
-        ref_img = first.get("image_url") or first.get("url") if isinstance(first, dict) else first
+    ref_img = collect_reference_images(req.reference_images, req.reference_image, req.image,
+                                       req.images) or None
 
     prompt = build_image_prompt(req)
     timeout = req.timeout or CFG.image_timeout
@@ -1251,13 +1272,8 @@ def cancel_task(task_id: str, _=Depends(auth)):
 @app.post("/v1/videos")
 @app.post("/v1/videos/generations")
 async def create_video(req: VideoRequest, _=Depends(auth)):
-    ref_img = None
-    if req.reference_image:
-        ref_img = req.reference_image
-    elif req.image_url:
-        ref_img = req.image_url if isinstance(req.image_url, str) else (req.image_url.get("url") if isinstance(req.image_url, dict) else None)
-    elif req.image:
-        ref_img = req.image.get("url") if isinstance(req.image, dict) else req.image
+    ref_img = collect_reference_images(req.reference_images, req.reference_image,
+                                       req.image_url, req.image) or None
 
     prompt = build_video_prompt(req)
     timeout = req.timeout or CFG.video_timeout

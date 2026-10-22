@@ -1225,97 +1225,109 @@ class MuseEngine:
         except Exception:
             pass
 
-    def _attach_image(self, image_data: str):
-        """将参考图通过 DataTransfer 附加到输入框，杜绝使用旧历史图片。"""
-        if not image_data:
+    MAX_REFERENCE_IMAGES = 6
+    MAX_REFERENCE_BYTES = 8 * 1024 * 1024
+
+    _INJECT_JS = """
+    (function(b64, mime, name) {
+        try {
+            var byteChars = atob(b64);
+            var byteNumbers = new Array(byteChars.length);
+            for (var i = 0; i < byteChars.length; i++) {
+                byteNumbers[i] = byteChars.charCodeAt(i);
+            }
+            var byteArray = new Uint8Array(byteNumbers);
+            var blob = new Blob([byteArray], {type: mime});
+            var ext = mime.split('/')[1] || 'png';
+            if (ext === 'jpeg') ext = 'jpg';
+            var file = new File([blob], name + '.' + ext, {type: mime});
+            // 现网 composer 里可能有多个 file input；优先取位于 composer 内的那个
+            var inputs = Array.from(document.querySelectorAll('input[type="file"]'));
+            if (!inputs.length) return JSON.stringify({ok: false, err: 'no-file-input'});
+            var ov = document.querySelector('[data-testid="hatch-composer-placeholder-overlay"]');
+            var composer = ov ? ov.closest('form') : null;
+            var input = null;
+            if (composer) {
+                input = inputs.find(function(x){ return composer.contains(x); }) || null;
+            }
+            if (!input) {
+                // 退而求其次：取不在对话气泡里的那个 input
+                input = inputs.find(function(x){
+                    return !x.closest('[class*=chat-user-bubble], [class*="group/msg"]');
+                }) || inputs[0];
+            }
+            // 有些版本 accept 为空，补上 image/* 让页面接受本次 File
+            if (!input.getAttribute('accept')) input.setAttribute('accept', 'image/*');
+            var dt = new DataTransfer();
+            dt.items.add(file);
+            input.files = dt.files;
+            input.dispatchEvent(new Event('change', {bubbles: true}));
+            input.dispatchEvent(new Event('input', {bubbles: true}));
+            return JSON.stringify({ok: true});
+        } catch(e) {
+            return JSON.stringify({ok: false, err: String(e)});
+        }
+    })(%s, %s, %s)
+    """
+
+    # 输入框里已确认的附件数：现网 UI 每个附件有一个「移除附件」按钮（中/英文），
+    # 没有按钮时以 composer 内缩略图数兜底；历史图片不能证明本次上传成功。
+    _ATTACHED_COUNT_JS = """(function(){
+        var btns = Array.from(document.querySelectorAll('button[aria-label]'));
+        var removes = btns.filter(function(b){
+            return /remove\\s*attachment|移除附件|删除附件/i.test(b.getAttribute('aria-label') || '');
+        }).length;
+        if (removes) return removes;
+        var ov = document.querySelector('[data-testid="hatch-composer-placeholder-overlay"]');
+        var composer = ov ? (ov.closest('form') || ov.parentElement.parentElement.parentElement) : null;
+        return composer ? composer.querySelectorAll('img, video').length : 0;
+    })()"""
+
+    def _attach_image(self, image_data):
+        """将参考图（一张或多张）通过 DataTransfer 逐张附加到输入框，每张都等页面确认，杜绝使用旧历史图片。"""
+        refs = [r for r in (image_data if isinstance(image_data, (list, tuple)) else [image_data]) if r]
+        if not refs:
             return
-        b64, mime = self._normalize_image(image_data)
-        if not b64:
-            raise MuseGenerationError("参考图读取失败，已停止生成")
+        if len(refs) > self.MAX_REFERENCE_IMAGES:
+            raise MuseGenerationError(f"参考图最多 {self.MAX_REFERENCE_IMAGES} 张")
+        files = []
+        for ref in refs:
+            b64, mime = self._normalize_image(ref)
+            if not b64:
+                raise MuseGenerationError("参考图读取失败，已停止生成")
+            files.append((b64, mime))
+        if sum(len(b64) * 3 // 4 for b64, _ in files) > self.MAX_REFERENCE_BYTES:
+            raise MuseGenerationError("参考图总大小超过 8MB，已停止生成")
 
         self._clear_attachments()
 
-        _INJECT_JS = """
-        (function(b64, mime) {
-            try {
-                var byteChars = atob(b64);
-                var byteNumbers = new Array(byteChars.length);
-                for (var i = 0; i < byteChars.length; i++) {
-                    byteNumbers[i] = byteChars.charCodeAt(i);
-                }
-                var byteArray = new Uint8Array(byteNumbers);
-                var blob = new Blob([byteArray], {type: mime});
-                var ext = mime.split('/')[1] || 'png';
-                if (ext === 'jpeg') ext = 'jpg';
-                var file = new File([blob], 'reference_image.' + ext, {type: mime});
-                // 现网 composer 里可能有多个 file input；优先取位于 composer 内的那个
-                var inputs = Array.from(document.querySelectorAll('input[type="file"]'));
-                if (!inputs.length) return JSON.stringify({ok: false, err: 'no-file-input'});
-                var ov = document.querySelector('[data-testid="hatch-composer-placeholder-overlay"]');
-                var composer = ov ? ov.closest('form') : null;
-                var input = null;
-                if (composer) {
-                    input = inputs.find(function(x){ return composer.contains(x); }) || null;
-                }
-                if (!input) {
-                    // 退而求其次：取不在对话气泡里的那个 input
-                    input = inputs.find(function(x){
-                        return !x.closest('[class*=chat-user-bubble], [class*="group/msg"]');
-                    }) || inputs[0];
-                }
-                // 有些版本 accept 为空，补上 image/* 让页面接受本次 File
-                if (!input.getAttribute('accept')) input.setAttribute('accept', 'image/*');
-                var dt = new DataTransfer();
-                dt.items.add(file);
-                input.files = dt.files;
-                input.dispatchEvent(new Event('change', {bubbles: true}));
-                input.dispatchEvent(new Event('input', {bubbles: true}));
-                return JSON.stringify({ok: true});
-            } catch(e) {
-                return JSON.stringify({ok: false, err: String(e)});
-            }
-        })(%s, %s)
-        """
-        try:
-            raw_res = self.page.js(_INJECT_JS % (json.dumps(b64), json.dumps(mime)))
-            res_obj = json.loads(raw_res) if isinstance(raw_res, str) else raw_res
-            if not res_obj.get("ok"):
-                raise MuseGenerationError("附加参考图失败，已停止生成")
-        except Exception as e:
-            raise MuseGenerationError("附加参考图失败，已停止生成") from e
+        for i, (b64, mime) in enumerate(files):
+            name = "reference_image" if len(files) == 1 else f"reference_image_{i + 1}"
+            try:
+                raw_res = self.page.js(self._INJECT_JS % (json.dumps(b64), json.dumps(mime), json.dumps(name)))
+                res_obj = json.loads(raw_res) if isinstance(raw_res, str) else raw_res
+                if not res_obj.get("ok"):
+                    raise MuseGenerationError("附加参考图失败，已停止生成")
+            except Exception as e:
+                raise MuseGenerationError("附加参考图失败，已停止生成") from e
 
-        # 等待输入框附件确认；历史图片不能证明本次上传成功。
-        # 现网 UI 已切中文：确认按钮 aria-label = "附加文件"/"移除附件"；
-        # 同时兼容英文（Remove attachment / Attach file），并以 composer 内缩略图兜底。
-        deadline = time.time() + 15.0
-        while time.time() < deadline:
-            has_attached = self.page.js(
-                """(function(){
-                var btns = Array.from(document.querySelectorAll('button[aria-label]'));
-                var hasRemove = btns.some(function(b){
-                    return /remove\\s*attachment|移除附件|删除附件/i.test(b.getAttribute('aria-label') || '');
-                });
-                if (hasRemove) return 'remove';
-                // 兜底：composer 内出现附件缩略图（img/video）
-                var ov = document.querySelector('[data-testid="hatch-composer-placeholder-overlay"]');
-                var composer = ov ? (ov.closest('form') || ov.parentElement.parentElement.parentElement) : null;
-                if (composer) {
-                    var media = composer.querySelectorAll('img, video');
-                    if (media.length > 0) return 'thumb';
-                }
-                return '';
-                })()"""
-            )
-            if has_attached:
-                break
-            time.sleep(0.3)
-        else:
-            raise MuseGenerationError("参考图上传未确认，已停止生成")
-        time.sleep(0.5)
+            deadline = time.time() + 15.0
+            while time.time() < deadline:
+                try:
+                    attached = int(self.page.js(self._ATTACHED_COUNT_JS) or 0)
+                except Exception:  # noqa: BLE001
+                    attached = 0
+                if attached >= i + 1:
+                    break
+                time.sleep(0.3)
+            else:
+                raise MuseGenerationError("参考图上传未确认，已停止生成")
+            time.sleep(0.5)
+
     # ---------------- 主流程 ----------------
     def generate(self, cookies: dict, prompt: str, expect: str = "image",
                  timeout: int = 240, expires: dict | None = None, account_id: str | None = None,
-                 on_progress=None, reference_image: str | None = None,
+                 on_progress=None, reference_image: str | list | None = None,
                  stop_event=None) -> dict:
         deadline = time.monotonic() + timeout
         self.ensure_page(cookies, expires, account_id=account_id)
