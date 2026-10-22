@@ -131,11 +131,19 @@ class ConcurrencyLock:
 
 
 class AccountPoolManager:
-    """账号并发冲突管理器：确保同一账号不会同时被两个并发任务操作，多账号则并行执行。"""
-    def __init__(self, store_instance):
+    """账号并发管理器：每个账号最多同时跑 per_account 个任务（每个任务有独立的浏览器上下文），
+    优先把任务分给空闲账号，所有账号都在忙时才在同一账号上叠加。"""
+    def __init__(self, store_instance, per_account: int = 1):
         self.store = store_instance
-        self.busy_accounts: set[str] = set()
+        self.per_account = max(1, per_account)
+        self.busy_accounts: dict[str, int] = {}
         self.cond = threading.Condition()
+
+    def _take(self, account_id: str):
+        self.busy_accounts[account_id] = self.busy_accounts.get(account_id, 0) + 1
+
+    def _full_ids(self) -> set[str]:
+        return {aid for aid, n in self.busy_accounts.items() if n >= self.per_account}
 
     def acquire(self, account_id: str | None = None, preferred_id: str | None = None,
                 rotate: bool = True, force_rotate: bool = False,
@@ -151,21 +159,25 @@ class AccountPoolManager:
                     acc = self.store.get_account(account_id)
                     if not acc or not acc.get("enabled", True):
                         raise MuseAuthError(f"指定账号 {account_id} 不存在或已禁用")
-                    if account_id not in self.busy_accounts:
-                        self.busy_accounts.add(account_id)
+                    if account_id not in self._full_ids():
+                        self._take(account_id)
                         return acc
                 else:
-                    pref = preferred_id if preferred_id not in self.busy_accounts else None
-                    acc = self.store.pick_account(
-                        preferred_id=pref,
-                        rotate=rotate,
-                        force_rotate=force_rotate,
-                        exclude_ids=self.busy_accounts,
-                        record_use=record_use,
-                    )
-                    if acc:
-                        self.busy_accounts.add(acc["id"])
-                        return acc
+                    # 先只看完全空闲的账号，没有再看未满额的账号
+                    for blocked in (set(self.busy_accounts), self._full_ids()):
+                        pref = preferred_id if preferred_id not in blocked else None
+                        acc = self.store.pick_account(
+                            preferred_id=pref,
+                            rotate=rotate,
+                            force_rotate=force_rotate,
+                            exclude_ids=blocked,
+                            record_use=record_use,
+                        )
+                        if acc:
+                            self._take(acc["id"])
+                            return acc
+                        if self.per_account == 1:
+                            break
 
                 live = [a for a in self.store.accounts if a.get("enabled", True) and a.get("cookies")]
                 if not live:
@@ -177,12 +189,16 @@ class AccountPoolManager:
         if not account_id:
             return
         with self.cond:
-            self.busy_accounts.discard(account_id)
+            n = self.busy_accounts.get(account_id, 0) - 1
+            if n > 0:
+                self.busy_accounts[account_id] = n
+            else:
+                self.busy_accounts.pop(account_id, None)
             self.cond.notify_all()
 
 
 GEN_LOCK = ConcurrencyLock(limit=CFG.max_concurrency)
-ACCOUNT_POOL = AccountPoolManager(store)
+ACCOUNT_POOL = AccountPoolManager(store, per_account=CFG.account_concurrency)
 IMAGE_TASK_LOCK = threading.Lock()
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 

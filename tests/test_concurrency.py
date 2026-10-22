@@ -92,6 +92,56 @@ def test_account_pool_manager():
     print("PASS: test_account_pool_manager")
 
 
+def test_account_pool_per_account_limit():
+    dummy_accounts = [
+        {"id": "acc-1", "label": "A1", "enabled": True, "cookies": {"k": "v1"}},
+        {"id": "acc-2", "label": "A2", "enabled": True, "cookies": {"k": "v2"}},
+    ]
+    dummy_store = SimpleNamespace(
+        accounts=dummy_accounts,
+        get_account=lambda aid: next((a for a in dummy_accounts if a["id"] == aid), None),
+        pick_account=lambda preferred_id=None, rotate=True, force_rotate=False, exclude_ids=None, record_use=True: next(
+            (a for a in dummy_accounts if a["id"] not in (exclude_ids or set())), None
+        )
+    )
+    pool = app.AccountPoolManager(dummy_store, per_account=2)
+
+    # 空闲账号优先：前两个任务分到两个不同账号
+    ids = [pool.acquire(timeout=0.5)["id"] for _ in range(2)]
+    assert ids == ["acc-1", "acc-2"]
+
+    # 都在忙时同一账号可再叠加一个任务，直到每个账号满 2 个
+    ids += [pool.acquire(timeout=0.5)["id"] for _ in range(2)]
+    assert sorted(ids) == ["acc-1", "acc-1", "acc-2", "acc-2"]
+    try:
+        pool.acquire(timeout=0.1)
+        raise AssertionError("每个账号已满 2 个任务，应超时")
+    except app.MuseGenerationError:
+        pass
+    try:
+        pool.acquire(account_id="acc-1", timeout=0.1)
+        raise AssertionError("指定的账号已满额，应超时")
+    except app.MuseGenerationError:
+        pass
+
+    # 释放一次只归还一个槽位
+    pool.release("acc-1")
+    assert pool.busy_accounts["acc-1"] == 1
+    assert pool.acquire(account_id="acc-1", timeout=0.1)["id"] == "acc-1"
+
+    for aid in ids:
+        pool.release(aid)
+    assert len(pool.busy_accounts) == 0
+    print("PASS: test_account_pool_per_account_limit")
+
+
+def test_account_concurrency_config_is_clamped():
+    with patch.dict(os.environ, {"MUSE2API_ACCOUNT_CONCURRENCY": "9"}):
+        assert Config().account_concurrency == 5
+    with patch.dict(os.environ, {"MUSE2API_ACCOUNT_CONCURRENCY": "0"}):
+        assert Config().account_concurrency == 1
+
+
 def test_parallel_generation_simulation():
     """模拟两个请求使用不同账号并发执行生成。"""
     dummy_accounts = [
@@ -151,5 +201,7 @@ def test_parallel_generation_simulation():
 if __name__ == "__main__":
     test_concurrency_lock()
     test_account_pool_manager()
+    test_account_pool_per_account_limit()
+    test_account_concurrency_config_is_clamped()
     test_parallel_generation_simulation()
     print("ALL CONCURRENCY TESTS PASSED!")
