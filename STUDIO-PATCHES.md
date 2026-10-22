@@ -13,14 +13,15 @@ browser-based media test). No test touches a real Muse account.
 | Tests | `tests/run_all.sh` runs pytest modules, script-style engine checks and the admin JS test | `47f6fa6` | — |
 | Cookie helper | `tools/get_muse_cookie.py` no longer waits for `hatch_gw` (Muse stopped issuing it) | `302417f` | Offline only (login flow not rerun) |
 | Local safety | Host defaults to `127.0.0.1`; CORS uses an allowlist; optional key for `/v1/media/*`; OpenAPI version from `version.json` | `c403006` | Offline only |
-| Concurrency | Several jobs per account (`MUSE2API_ACCOUNT_CONCURRENCY`, default 2, max 5); idle accounts first | `f3731e1` | Pending |
-| Stop detection | Wait loop reads the thread's status from the page's `sessions.list` every ~8s and ends on `interrupted`/`failed` | `c1c5864` | Pending |
-| Cancel | `POST /v1/tasks/{id}/cancel`; queued tasks never reach Muse, running ones click Muse's stop button | `e2f0c99`, `140e8bf` | Pending |
+| Concurrency | Several jobs per account (`MUSE2API_ACCOUNT_CONCURRENCY`, default 2, max 5); idle accounts first | `f3731e1` | Verified 2026-10-23: 2 images ran at once on one account |
+| Stop detection | Wait loop reads the thread's status from the page's `sessions.list` every ~8s and ends on `interrupted`/`failed` | `c1c5864` | Verified: `/thread/<id>` equals `session_id` |
+| Cancel | `POST /v1/tasks/{id}/cancel`; queued tasks never reach Muse, running ones click Muse's stop button | `e2f0c99`, `140e8bf` | Verified: video cancelled in 3s, Muse session `interrupted` |
 | Task lookup | `GET /v1/tasks/{id}` for image and video tasks | `fe0e69a` | Offline only |
 | Encryption | `accounts.json` encrypted with Fernet when `MUSE2API_DATA_KEY` is set | `18321c0` | Offline only |
-| Reference images | `reference_images` (≤ 6, ≤ 8MB total) for image and video tasks, uploaded one by one | `ca24d3f` | Pending (checked against a fake composer in Chrome) |
-| Resume | Muse thread id + account stored on the task; on startup the thread is reopened to fetch the result | `8f4ce03` | Pending |
+| Reference images | `reference_images` (≤ 6, ≤ 8MB total) for image and video tasks, uploaded one by one | `ca24d3f` | Verified: 3 references accepted, all used in the output |
+| Resume | Muse thread id + account stored on the task; on startup the thread is reopened to fetch the result | `8f4ce03` | Verified: engine stopped mid-video, restarted, same thread's video fetched |
 | Readiness | `/readyz` reports `version` | `74b0526` | Offline only |
+| Browser lifecycle | One Chromium even when jobs start concurrently; a reattached browser is closed on stop | `cb7fa8d` | Verified: no Chrome left after shutdown |
 
 Quota stays on upstream's UI scraping: the server action HaoHao used no longer exists on Muse.
 
@@ -46,17 +47,11 @@ Quota stays on upstream's UI scraping: the server action HaoHao used no longer e
 - `/readyz` adds `version`.
 - New task status `cancelled`.
 
-## Waiting for a live check
+## Live check (2026-10-23)
 
-These rely on Muse behaviour that the offline tests can only fake. They need one session with a real
-account (and the user's OK, since they use quota):
-
-1. The `/thread/<id>` path segment equals `session_id` in `sessions.list` (stop detection and resume
-   depend on it; if not, both quietly do nothing).
-2. Two jobs on one account from two isolated browser contexts both finish, and cookie syncing after
-   each job does not log the other out.
-3. Cancel from the engine's own page moves the Muse session to `interrupted` and frees the account.
-4. Three reference images are all accepted by the real composer.
-5. Killing the engine mid-video and starting it again completes the task from the same thread.
-6. `tools/get_muse_cookie.py` finishes a login without waiting for `hatch_gw` (only if that helper is still used;
-   Muse Studio captures logins itself).
+All five checks passed with one real account: thread id equals `session_id`; two jobs on one
+account ran in parallel (35s and 162s); a running video was cancelled in 3s and its Muse session
+became `interrupted`; three reference images were all used; a video survived an engine restart and
+was fetched from the same thread. The run also exposed concurrent `start()` launching two Chromium
+processes (fixed in `cb7fa8d`). Not rerun: `tools/get_muse_cookie.py` login (Muse Studio captures
+logins itself).
