@@ -95,15 +95,83 @@ def _write(path: str, obj):
             os.unlink(tmp)
 
 
+# accounts.json 加密后的文件头；其后是 Fernet 密文
+_ENC_PREFIX = "MUSE2API-ENC1:"
+
+
+def _fernet(key: str):
+    if not key:
+        return None
+    from cryptography.fernet import Fernet
+    return Fernet(key.encode())
+
+
+def _read_accounts(path: str, key: str) -> list:
+    """读取账号文件：设置了 MUSE2API_DATA_KEY 时解密；密文但缺密钥/密钥错误时直接报错，
+    绝不当成「没有账号」继续运行（那样下一次保存会覆盖掉原文件）。"""
+    if not os.path.isfile(path):
+        return []
+    with open(path, encoding="utf-8") as f:
+        raw = f.read()
+    if raw.startswith(_ENC_PREFIX):
+        fernet = _fernet(key)
+        if fernet is None:
+            raise RuntimeError(f"{path} 已加密，请设置 MUSE2API_DATA_KEY 后再启动")
+        from cryptography.fernet import InvalidToken
+        try:
+            return json.loads(fernet.decrypt(raw[len(_ENC_PREFIX):].encode()).decode("utf-8"))
+        except InvalidToken:
+            raise RuntimeError(f"{path} 解密失败：MUSE2API_DATA_KEY 不正确") from None
+    try:
+        return json.loads(raw)
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def _write_accounts(path: str, accounts: list, key: str):
+    fernet = _fernet(key)
+    if fernet is None:
+        _write(path, accounts)
+        return
+    token = fernet.encrypt(json.dumps(accounts, ensure_ascii=False).encode("utf-8")).decode()
+    d = os.path.dirname(path)
+    os.makedirs(d, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=d)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(_ENC_PREFIX + token)
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+
+
 class Store:
     def __init__(self, cfg):
         self.cfg = cfg
-        self.accounts: list[dict] = _read(cfg.accounts_file, [])
+        self.accounts: list[dict] = _read_accounts(cfg.accounts_file, self._data_key)
+        if self._data_key and self.accounts and not self._accounts_encrypted():
+            # 设置密钥后首次启动：把明文账号文件改写为密文
+            self._save_accounts()
         for a in self.accounts:
             ce = a.get("cookies_exp") or {}
             if _is_pos(ce.get("hatch_vml")):
                 a["expires_at"] = int(ce["hatch_vml"])
         self.tasks: dict[str, dict] = _read(cfg.tasks_file, {})
+
+    @property
+    def _data_key(self) -> str:
+        return getattr(self.cfg, "data_key", "") or ""
+
+    def _accounts_encrypted(self) -> bool:
+        try:
+            with open(self.cfg.accounts_file, encoding="utf-8") as f:
+                return f.read(len(_ENC_PREFIX)) == _ENC_PREFIX
+        except OSError:
+            return False
+
+    def _save_accounts(self):
+        _write_accounts(self.cfg.accounts_file, self.accounts, self._data_key)
 
     # ---------- 账号 ----------
     def add_account(self, cookies: dict, label: str = "",
@@ -120,7 +188,7 @@ class Store:
                    "last_used": None, "last_keepalive": None, "use_count": 0,
                    "ok": None, "note": "", "synced_at": None}
             self.accounts.append(acc)
-            _write(self.cfg.accounts_file, self.accounts)
+            self._save_accounts()
             return acc
 
     def list_accounts(self) -> list[dict]:
@@ -142,7 +210,7 @@ class Store:
         with _LOCK:
             n = len(self.accounts)
             self.accounts = [a for a in self.accounts if a["id"] != aid]
-            _write(self.cfg.accounts_file, self.accounts)
+            self._save_accounts()
             return len(self.accounts) != n
 
     def pick_account(self, preferred_id: str | None = None, rotate: bool = True,
@@ -177,7 +245,7 @@ class Store:
                             if record_use:
                                 a["last_used"] = time.time()
                                 a["use_count"] = a.get("use_count", 0) + 1
-                                _write(self.cfg.accounts_file, self.accounts)
+                                self._save_accounts()
                             return a
             healthy = [a for a in live if a.get("ok") is not False]
             candidates = healthy if healthy else live
@@ -188,7 +256,7 @@ class Store:
             if record_use:
                 acc["last_used"] = time.time()
                 acc["use_count"] = acc.get("use_count", 0) + 1
-                _write(self.cfg.accounts_file, self.accounts)
+                self._save_accounts()
             return acc
 
     def touch_keepalive(self, aid: str, ok: bool | None = True, note: str = ""):
@@ -207,7 +275,7 @@ class Store:
                     if note:
                         a["note"] = note[:300]
                     a["checked_at"] = now_ts
-            _write(self.cfg.accounts_file, self.accounts)
+            self._save_accounts()
 
     def mark(self, aid: str, ok: bool, note: str = ""):
         with _LOCK:
@@ -216,7 +284,7 @@ class Store:
                     a["ok"] = ok
                     a["note"] = note[:300]
                     a["checked_at"] = int(time.time())
-            _write(self.cfg.accounts_file, self.accounts)
+            self._save_accounts()
 
     def get_account(self, aid: str) -> dict | None:
         for a in self.accounts:
@@ -247,7 +315,7 @@ class Store:
                             a["expiry_anchor"] = int(time.time())
                         a["expires_at"] = account_expiry(
                             ce, a.get("expiry_anchor") or a.get("created_at"))
-                    _write(self.cfg.accounts_file, self.accounts)
+                    self._save_accounts()
                     return a
         return None
 

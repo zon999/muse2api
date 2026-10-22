@@ -98,6 +98,9 @@ class Config:
         default_factory=lambda: _env("MUSE2API_CORS_ORIGINS",
                                      "https://muse.ai,https://www.muse.ai"))
 
+    # 账号文件加密密钥（Fernet key）；留空则 accounts.json 以明文保存
+    data_key: str = field(default_factory=lambda: _env("MUSE2API_DATA_KEY", "").strip())
+
     # 媒体文件 /v1/media/* 是否也要求 Bearer Key（1=要求）
     media_auth: bool = field(default_factory=lambda: _env("MUSE2API_MEDIA_AUTH", "0") == "1")
 
