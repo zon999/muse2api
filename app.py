@@ -201,6 +201,8 @@ class AccountPoolManager:
 GEN_LOCK = ConcurrencyLock(limit=CFG.max_concurrency)
 ACCOUNT_POOL = AccountPoolManager(store, per_account=CFG.account_concurrency)
 IMAGE_TASK_LOCK = threading.Lock()
+# 进行中的生图/生视频任务的取消信号：task_id -> Event
+TASK_CANCEL: dict[str, threading.Event] = {}
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
@@ -879,26 +881,34 @@ def _pos(v) -> bool:
 def _run_generation(prompt: str, kind: str, timeout: int,
                     account_id: str | None = None, on_progress=None,
                     reference_image: str | None = None,
-                    on_acquired=None) -> tuple[dict, str | None]:
+                    on_acquired=None, stop_event=None) -> tuple[dict, str | None]:
     # Browser ownership covers account selection, retry and cleanup, not just generate().
     deadline = time.monotonic() + max(1, timeout)
-    if not GEN_LOCK.acquire(timeout=max(1, timeout)):
-        raise MuseGenerationError("等待浏览器队列超时，请稍后重试")
+    # 排队时分段等待，以便在拿到浏览器槽位前也能响应取消
+    while not GEN_LOCK.acquire(timeout=min(1.0, max(0.05, deadline - time.monotonic()))):
+        if stop_event is not None and stop_event.is_set():
+            raise MuseSessionStopped("cancelled")
+        if time.monotonic() >= deadline:
+            raise MuseGenerationError("等待浏览器队列超时，请稍后重试")
     try:
+        if stop_event is not None and stop_event.is_set():
+            raise MuseSessionStopped("cancelled")
         if on_acquired:
             try:
                 on_acquired()
             except Exception:
                 pass
         return _run_generation_locked(prompt, kind, timeout, account_id,
-                                      on_progress, reference_image, deadline=deadline)
+                                      on_progress, reference_image, deadline=deadline,
+                                      stop_event=stop_event)
     finally:
         GEN_LOCK.release()
 
 
 def _run_generation_locked(prompt: str, kind: str, timeout: int,
                     account_id: str | None = None, on_progress=None,
-                    reference_image: str | None = None, deadline=None) -> tuple[dict, str | None]:
+                    reference_image: str | None = None, deadline=None,
+                    stop_event=None) -> tuple[dict, str | None]:
     remaining_wait = int(deadline - time.monotonic()) if deadline is not None else timeout
     preferred_id = getattr(engine, "current_acc_id", None)
     if kind == "video" and not account_id:
@@ -923,8 +933,8 @@ def _run_generation_locked(prompt: str, kind: str, timeout: int,
             if attempt > 0:
                 if last_exc and "未产出媒体附件，仅返回了文本回复" in str(last_exc):
                     break
-                # 会话被人为中断（在 Muse 里点了停止）时不换号重试
-                if isinstance(last_exc, MuseSessionStopped) and last_exc.status == "interrupted":
+                # 会话被人为中断（在 Muse 里点了停止）或任务已取消时不换号重试
+                if isinstance(last_exc, MuseSessionStopped) and last_exc.status in ("interrupted", "cancelled"):
                     break
                 old_id = cur_acc["id"] if cur_acc else None
                 if old_id:
@@ -951,7 +961,7 @@ def _run_generation_locked(prompt: str, kind: str, timeout: int,
                 res = engine.generate(cur_acc["cookies"], prompt, expect=kind,
                                       timeout=remaining, expires=cur_acc.get("cookies_exp"),
                                       account_id=cur_acc["id"], on_progress=on_progress,
-                                      reference_image=reference_image)
+                                      reference_image=reference_image, stop_event=stop_event)
                 store.mark(cur_acc["id"], True, "")
                 _sync_cookies(cur_acc["id"])
                 return res, cur_acc["id"]
@@ -1038,6 +1048,8 @@ def _queue_image(req: ImageRequest, prompt: str, reference_image: str | None,
                           response_format=req.response_format, progress=0,
                           image_request_key=key_hash, image_request_hash=request_hash)
 
+    stop_event = TASK_CANCEL[tid] = threading.Event()
+
     def worker():
         timing = {"t0": time.time()}
         def _on_acquired():
@@ -1048,7 +1060,7 @@ def _queue_image(req: ImageRequest, prompt: str, reference_image: str | None,
                 prompt, "image", req.timeout or CFG.image_timeout,
                 reference_image=reference_image,
                 on_progress=lambda p: store.update_task(tid, progress=p),
-                on_acquired=_on_acquired)
+                on_acquired=_on_acquired, stop_event=stop_event)
             # Store only media metadata, not large base64 payloads or reference credentials.
             store.update_task(tid, status="completed", progress=100, account=acc_id,
                               elapsed=round(time.time() - timing["t0"], 1),
@@ -1056,8 +1068,9 @@ def _queue_image(req: ImageRequest, prompt: str, reference_image: str | None,
                               result={**{k: res[k] for k in ("filename", "size", "kind")},
                                       "url": media_url(res["filename"])})
         except Exception as exc:  # noqa: BLE001
-            store.update_task(tid, status="failed", error=str(exc),
-                              elapsed=round(time.time() - timing["t0"], 1))
+            _finish_failed_task(tid, exc, stop_event, timing["t0"])
+        finally:
+            TASK_CANCEL.pop(tid, None)
 
     threading.Thread(target=worker, daemon=True).start()
     return JSONResponse(status_code=202, content={
@@ -1196,6 +1209,28 @@ async def images_edits(request: Request, _=Depends(auth)):
     return _image_response(req_obj, res)
 
 
+def _finish_failed_task(tid: str, exc: Exception, stop_event, t0: float):
+    """任务异常结束：用户取消的记为 cancelled，其余记为 failed。"""
+    elapsed = round(time.time() - t0, 1)
+    if stop_event.is_set() or (isinstance(exc, MuseSessionStopped) and exc.status == "cancelled"):
+        store.update_task(tid, status="cancelled", error="任务已取消", elapsed=elapsed)
+    else:
+        store.update_task(tid, status="failed", error=str(exc), elapsed=elapsed)
+
+
+@app.post("/v1/tasks/{task_id}/cancel")
+def cancel_task(task_id: str, _=Depends(auth)):
+    """取消排队中或生成中的生图/生视频任务；生成中会点击 Muse 的停止按钮结束会话。"""
+    task = store.get_task(task_id)
+    if not task:
+        raise HTTPException(404, "task 不存在")
+    event = TASK_CANCEL.get(task_id)
+    if not event or task.get("status") in ("completed", "failed", "cancelled"):
+        raise HTTPException(409, f"任务已结束（{task.get('status')}），无法取消")
+    event.set()
+    return {"id": task_id, "task_id": task_id, "status": "cancelling"}
+
+
 # ------------------------- 生视频（异步任务） -------------------------
 @app.post("/v1/videos")
 @app.post("/v1/videos/generations")
@@ -1214,6 +1249,7 @@ async def create_video(req: VideoRequest, _=Depends(auth)):
     store.update_task(task["id"], api_prompt=prompt)
 
     store.update_task(task["id"], progress=10)
+    stop_event = TASK_CANCEL[task["id"]] = threading.Event()
 
     def worker():
         timing = {"t0": time.time()}
@@ -1224,7 +1260,8 @@ async def create_video(req: VideoRequest, _=Depends(auth)):
             def prog_cb(p):
                 store.update_task(task["id"], progress=p)
             res, acc_id = _run_generation(prompt, "video", timeout, on_progress=prog_cb,
-                                          reference_image=ref_img, on_acquired=_on_acquired)
+                                          reference_image=ref_img, on_acquired=_on_acquired,
+                                          stop_event=stop_event)
             vurl = media_url(res["filename"])
             store.update_task(task["id"], status="completed", progress=100, account=acc_id,
                               elapsed=round(time.time() - timing["t0"], 1),
@@ -1234,8 +1271,9 @@ async def create_video(req: VideoRequest, _=Depends(auth)):
                                       "filename": res["filename"],
                                       "bytes": res["size"], "kind": res["kind"]})
         except Exception as exc:  # noqa: BLE001
-            store.update_task(task["id"], status="failed",
-                              elapsed=round(time.time() - timing["t0"], 1), error=str(exc))
+            _finish_failed_task(task["id"], exc, stop_event, timing["t0"])
+        finally:
+            TASK_CANCEL.pop(task["id"], None)
 
     threading.Thread(target=worker, daemon=True).start()
     return {"id": task["id"], "task_id": task["id"], "object": "video.task", "status": "queued",

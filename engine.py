@@ -818,6 +818,22 @@ class MuseEngine:
     })()"""
     STOPPED_SESSION_STATUSES = ("interrupted", "failed", "error", "cancelled", "canceled")
 
+    _STOP_JS = r"""(function(){
+      var b = document.querySelector('[data-testid="hatch-composer-stop-button"]')
+        || document.querySelector('button[aria-label*="Stop" i]')
+        || document.querySelector('button[aria-label*="停止"]');
+      if (!b) return 'no-button';
+      b.click();
+      return 'clicked';
+    })()"""
+
+    def stop_generation(self) -> str:
+        """点击 Muse 输入框的停止按钮，让 Muse 端结束当前会话（会话状态变为 interrupted）。"""
+        try:
+            return str(self.page.js(self._STOP_JS) or "")
+        except Exception:  # noqa: BLE001
+            return "error"
+
     def _muse_session_status(self) -> str:
         """读取不到（页面未就绪、接口变化、找不到会话）时返回空串，调用方按未知处理。"""
         try:
@@ -836,7 +852,8 @@ class MuseEngine:
         next_session_check = t_start + 10.0
         while time.time() < deadline:
             if stop_event is not None and stop_event.is_set():
-                raise MuseGenerationError("客户端已断开连接，终止生成任务")
+                log.info("任务已取消，停止 Muse 会话: %s", self.stop_generation())
+                raise MuseSessionStopped("cancelled")
             time.sleep(0.6)
             self._scroll_bottom()
             atts = self.attachments()
@@ -1315,6 +1332,8 @@ class MuseEngine:
         base_agent_cnt = self._agent_count()
         if time.monotonic() >= deadline:
             raise MuseGenerationError("任务准备超时，已停止发送")
+        if stop_event is not None and stop_event.is_set():
+            raise MuseSessionStopped("cancelled")
         if self._send(prompt) not in ("clicked", "enter-sent"):
             raise MuseGenerationError("提示词发送未确认，已停止生成")
         att = self._wait_attachment(

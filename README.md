@@ -227,6 +227,14 @@ curl -X POST "http://localhost:18610/v1/images/generations" \
   }
   ```
 
+- **取消任务（生图任务与视频任务通用）**
+  ```bash
+  curl -X POST "http://localhost:18610/v1/tasks/task_xyz789/cancel" \
+    -H "Authorization: Bearer m2a_your_secret_key"
+  ```
+  排队中的任务直接取消；生成中的任务会点击 Muse 的停止按钮结束会话并立即释放账号，
+  任务状态变为 `cancelled`。已结束的任务返回 409。
+
 ---
 
 ## ⚙️ 环境变量配置一览

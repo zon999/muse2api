@@ -154,7 +154,7 @@ def test_parallel_generation_simulation():
     concurrency_observed = False
     lock = threading.Lock()
 
-    def fake_generate(cookies, prompt, expect, timeout, expires=None, account_id=None, on_progress=None, reference_image=None):
+    def fake_generate(cookies, prompt, expect, timeout, expires=None, account_id=None, on_progress=None, reference_image=None, stop_event=None):
         nonlocal concurrency_observed
         t_name = threading.current_thread().name
         with lock:
