@@ -53,10 +53,11 @@ def request(method, path, payload=None):
 
 
 def wait_status(task_id, wanted, timeout=5.0):
+    """Wait for the status and for the worker to finish its cleanup (cancel entry removed)."""
     end = time.monotonic() + timeout
     while time.monotonic() < end:
         task = app_module().store.get_task(task_id)
-        if task and task.get("status") == wanted:
+        if task and task.get("status") == wanted and task_id not in app_module().TASK_CANCEL:
             return task
         time.sleep(0.02)
     raise AssertionError(f"task {task_id} never reached {wanted}: {app_module().store.get_task(task_id)}")

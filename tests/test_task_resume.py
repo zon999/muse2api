@@ -92,7 +92,8 @@ def wait_status(app, tid, wanted, timeout=5.0):
     end = time.monotonic() + timeout
     while time.monotonic() < end:
         task = app.store.get_task(tid)
-        if task and task.get("status") == wanted:
+        # the worker is only done once its cancel entry is removed
+        if task and task.get("status") == wanted and tid not in app.TASK_CANCEL:
             return task
         time.sleep(0.02)
     raise AssertionError(f"{tid} never reached {wanted}: {app.store.get_task(tid)}")

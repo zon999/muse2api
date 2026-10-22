@@ -11,7 +11,7 @@ browser-based media test). No test touches a real Muse account.
 | Area | Change | Commit | Live status |
 |---|---|---|---|
 | Tests | `tests/run_all.sh` runs pytest modules, script-style engine checks and the admin JS test | `47f6fa6` | — |
-| Cookie helper | `tools/get_muse_cookie.py` no longer waits for `hatch_gw` (Muse stopped issuing it) | `302417f` | Verified (spike) |
+| Cookie helper | `tools/get_muse_cookie.py` no longer waits for `hatch_gw` (Muse stopped issuing it) | `302417f` | Offline only (login flow not rerun) |
 | Local safety | Host defaults to `127.0.0.1`; CORS uses an allowlist; optional key for `/v1/media/*`; OpenAPI version from `version.json` | `c403006` | Offline only |
 | Concurrency | Several jobs per account (`MUSE2API_ACCOUNT_CONCURRENCY`, default 2, max 5); idle accounts first | `f3731e1` | Pending |
 | Stop detection | Wait loop reads the thread's status from the page's `sessions.list` every ~8s and ends on `interrupted`/`failed` | `c1c5864` | Pending |
@@ -58,3 +58,5 @@ account (and the user's OK, since they use quota):
 3. Cancel from the engine's own page moves the Muse session to `interrupted` and frees the account.
 4. Three reference images are all accepted by the real composer.
 5. Killing the engine mid-video and starting it again completes the task from the same thread.
+6. `tools/get_muse_cookie.py` finishes a login without waiting for `hatch_gw` (only if that helper is still used;
+   Muse Studio captures logins itself).
