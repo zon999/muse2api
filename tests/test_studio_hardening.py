@@ -107,4 +107,7 @@ def test_readyz_reports_version():
     with tempfile.TemporaryDirectory(prefix="muse-hardening-") as tmp:
         module = load_app(tmp)
         status, _, body = asyncio.run(call(module.app, "GET", "/readyz"))
-        assert status == 200 and json.loads(body)["version"] == module.app.version
+        data = json.loads(body)
+        assert status == 200 and data["version"] == module.app.version
+        assert data["concurrency"] == module.CFG.max_concurrency
+        assert data["account_concurrency"] == module.CFG.account_concurrency

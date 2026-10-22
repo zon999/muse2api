@@ -1039,7 +1039,9 @@ def readyz():
     return {"status": "ready" if accs else "no_account",
             "accounts": len(accs),
             "browser_running": bool(engine.proc and engine.proc.poll() is None),
-            "version": app.version}
+            "version": app.version,
+            "concurrency": CFG.max_concurrency,
+            "account_concurrency": CFG.account_concurrency}
 
 
 @app.get("/v1/models")
