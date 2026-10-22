@@ -198,3 +198,36 @@ def test_unified_task_lookup():
     assert status == 200 and body["kind"] == "video" and body["status"] == "cancelled"
     status, _ = request("GET", "/v1/tasks/does-not-exist")
     assert status == 404
+
+
+def test_cancel_while_waiting_for_busy_account():
+    app = app_module()
+    calls = []
+
+    def fake_generate(*a, **k):
+        calls.append(1)
+        return {"filename": "x.png", "size": 1, "kind": "image"}
+
+    _, patches = patched_app(fake_generate)
+
+    def scenario():
+        # Browser slots are free but the only account is at its per-account limit
+        held = [app.ACCOUNT_POOL.acquire(account_id="acc-1", timeout=1)
+                for _ in range(app.ACCOUNT_POOL.per_account)]
+        try:
+            status, body = request("POST", "/v1/images/tasks", {"prompt": "p"})
+            assert status == 202, body
+            tid = body["id"]
+            time.sleep(0.2)
+            t0 = time.monotonic()
+            status, _ = request("POST", f"/v1/tasks/{tid}/cancel")
+            assert status == 200
+            wait_status(tid, "cancelled", timeout=3)
+            assert time.monotonic() - t0 < 1.5
+        finally:
+            for acc in held:
+                app.ACCOUNT_POOL.release(acc["id"])
+
+    run_with(patches, scenario)
+    assert calls == []
+    assert len(app.ACCOUNT_POOL.busy_accounts) == 0

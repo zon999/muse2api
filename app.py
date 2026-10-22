@@ -148,10 +148,12 @@ class AccountPoolManager:
 
     def acquire(self, account_id: str | None = None, preferred_id: str | None = None,
                 rotate: bool = True, force_rotate: bool = False,
-                timeout: float = 60.0, record_use: bool = True) -> dict:
+                timeout: float = 60.0, record_use: bool = True, stop_event=None) -> dict:
         deadline = time.monotonic() + timeout
         with self.cond:
             while True:
+                if stop_event is not None and stop_event.is_set():
+                    raise MuseSessionStopped("cancelled")
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise MuseGenerationError("等待空闲账号超时，当前所有账号均处于繁忙中")
@@ -923,7 +925,7 @@ def _run_generation_locked(prompt: str, kind: str, timeout: int,
                 break
     acc = ACCOUNT_POOL.acquire(account_id=account_id,
                                preferred_id=preferred_id,
-                               timeout=max(1, remaining_wait))
+                               timeout=max(1, remaining_wait), stop_event=stop_event)
     cur_acc = acc
     last_exc = None
     try:
@@ -943,7 +945,8 @@ def _run_generation_locked(prompt: str, kind: str, timeout: int,
                 rem = int(deadline - time.monotonic()) if deadline is not None else timeout
                 if rem <= 0:
                     break
-                alt = ACCOUNT_POOL.acquire(rotate=True, force_rotate=True, timeout=rem)
+                alt = ACCOUNT_POOL.acquire(rotate=True, force_rotate=True, timeout=rem,
+                                           stop_event=stop_event)
                 if not alt or (old_id and alt["id"] == old_id):
                     if alt:
                         cur_acc = alt
@@ -971,7 +974,9 @@ def _run_generation_locked(prompt: str, kind: str, timeout: int,
                 engine.close_current_page()
             except MuseGenerationError as exc:
                 last_exc = exc
-                store.mark(cur_acc["id"], True, f"任务异常: {str(exc)[:60]}")
+                # 用户取消不是账号问题，不记为账号异常
+                if not (isinstance(exc, MuseSessionStopped) and exc.status == "cancelled"):
+                    store.mark(cur_acc["id"], True, f"任务异常: {str(exc)[:60]}")
                 try:
                     engine.reset_thread()
                 except Exception:
