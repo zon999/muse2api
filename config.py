@@ -65,7 +65,7 @@ def _detect_chromium() -> str:
 @dataclass
 class Config:
     base_dir: str = field(default_factory=lambda: _env("MUSE2API_HOME", _DEFAULT_BASE_DIR))
-    host: str = field(default_factory=lambda: _env("MUSE2API_HOST", "0.0.0.0"))
+    host: str = field(default_factory=lambda: _env("MUSE2API_HOST", "127.0.0.1"))
     port: int = field(default_factory=lambda: int(_env("MUSE2API_PORT", "18610")))
 
     # 浏览器
@@ -97,6 +97,9 @@ class Config:
     cors_origins: str = field(
         default_factory=lambda: _env("MUSE2API_CORS_ORIGINS",
                                      "https://muse.ai,https://www.muse.ai"))
+
+    # 媒体文件 /v1/media/* 是否也要求 Bearer Key（1=要求）
+    media_auth: bool = field(default_factory=lambda: _env("MUSE2API_MEDIA_AUTH", "0") == "1")
 
     # 生成
     image_timeout: int = field(default_factory=lambda: int(_env("MUSE2API_IMAGE_TIMEOUT", "240")))

@@ -237,6 +237,8 @@ curl -X POST "http://localhost:18610/v1/images/generations" \
 | `MUSE2API_HOST` | `127.0.0.1` | 监听 IP（Docker 内建议 `0.0.0.0`） |
 | `MUSE2API_PORT` | `18610` | 服务运行端口 |
 | `MUSE2API_PUBLIC_BASE` | `空` | 对外完整 URL 前缀，留空时前端自动识别访问来源 |
+| `MUSE2API_CORS_ORIGINS` | `https://muse.ai,https://www.muse.ai` | 允许跨域的来源（逗号分隔），浏览器端客户端需跨域时加入其来源，`*` 放行所有 |
+| `MUSE2API_MEDIA_AUTH` | `0` | 设为 `1` 时 `/v1/media/*` 也要求 Bearer Key |
 | `MUSE2API_CHROMIUM` | `chromium` | 浏览器可执行程序完整路径 |
 | `MUSE2API_CDP_PORT` | `19210` | 内部 CDP 调试通信端口 |
 | `MUSE2API_CONCURRENCY` | `2` | 最大并发生成任务数（支持随服务器资源自由调高，默认 2） |

@@ -57,19 +57,29 @@ if not log.handlers:
     log.addHandler(_h)
 
 CFG.ensure_dirs()
-app = FastAPI(title="muse2api", version="1.5.4")
 
-# Cookie 助手脚本从 muse.ai 页面发起导入请求，需要放行该来源；
-# 浏览器扩展从 chrome-extension:// 发起，也一并放行。
-#
-# 这里直接放行所有来源：本服务用 Bearer Key 鉴权、不依赖 Cookie，
-# 放行来源不会带来越权风险；反之如果把来源限死，浏览器端的智能体
-# （Open WebUI / LobeChat / 各种 Web 客户端）会被 CORS 拦住用不了。
+
+def _app_version() -> str:
+    """OpenAPI 版本号以 version.json 为准，避免和发布版本脱节。"""
+    try:
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "version.json"),
+                  encoding="utf-8") as f:
+            return str(json.load(f).get("version") or "0.0.0")
+    except Exception:
+        return "0.0.0"
+
+
+app = FastAPI(title="muse2api", version=_app_version())
+
+# 跨域来源由 MUSE2API_CORS_ORIGINS 控制（逗号分隔），默认只放行 muse.ai，
+# 供 Cookie 助手脚本从 muse.ai 页面提交导入请求。
+# 浏览器端的智能体（Open WebUI / LobeChat 等）需要跨域时，把它们的来源加进去，
+# 或设为 "*" 放行所有来源。
 _origins = [o.strip() for o in (CFG.cors_origins or "").split(",") if o.strip()]
 from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
 
 app.add_middleware(CORSMiddleware,
-                   allow_origins=["*"],
+                   allow_origins=_origins,
                    allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
                    allow_headers=["*"],
                    expose_headers=["*"],
@@ -1544,8 +1554,15 @@ async def responses_api(req: ResponsesRequest, _=Depends(auth)):
     return envelope("completed", text)
 
 
+def media_auth(authorization: str | None = Header(default=None)):
+    """MUSE2API_MEDIA_AUTH=1 时媒体文件也要求 Bearer Key；默认公开，方便客户端直接用 URL 展示。"""
+    if CFG.media_auth:
+        return auth(authorization)
+    return True
+
+
 @app.get("/v1/media/{name}")
-def get_media(name: str):
+def get_media(name: str, _=Depends(media_auth)):
     if "/" in name or "\\" in name or ".." in name:
         raise HTTPException(400, "非法文件名")
     p = os.path.join(CFG.media_dir, name)
