@@ -42,6 +42,13 @@ class MuseGenerationError(RuntimeError):
     pass
 
 
+class MuseSessionStopped(MuseGenerationError):
+    """Muse 端的会话已停止（被中断或失败），不会再产出结果。"""
+    def __init__(self, status: str):
+        super().__init__(f"Muse 会话已停止（{status}），不会再产出结果")
+        self.status = status
+
+
 class MuseEngine:
     def __init__(self, cfg):
         self.cfg = cfg
@@ -799,6 +806,25 @@ class MuseEngine:
         except Exception:  # noqa: BLE001
             pass
 
+    # 当前线程页面对应的 Muse 会话状态：URL /thread/<id> 与 sessions.list 的 session_id 对应
+    _SESSION_STATUS_JS = r"""(async function(){
+      var m = location.pathname.match(/\/thread\/([^\/?#]+)/);
+      var snap = window.__hatchEarlyGatewayRuntimeState && window.__hatchEarlyGatewayRuntimeState.activeRuntime
+        && window.__hatchEarlyGatewayRuntimeState.activeRuntime.getSnapshot();
+      if (!m || !snap || typeof snap.sendRequest !== 'function') return '';
+      var r = await snap.sendRequest('sessions.list', {});
+      var s = ((r && r.sessions) || []).find(function(x){ return x.session_id === m[1]; });
+      return s ? String(s.status || '') : '';
+    })()"""
+    STOPPED_SESSION_STATUSES = ("interrupted", "failed", "error", "cancelled", "canceled")
+
+    def _muse_session_status(self) -> str:
+        """读取不到（页面未就绪、接口变化、找不到会话）时返回空串，调用方按未知处理。"""
+        try:
+            return str(self.page.js(self._SESSION_STATUS_JS, await_promise=True, timeout=10) or "")
+        except Exception:  # noqa: BLE001
+            return ""
+
     def _wait_attachment(self, baseline_src: str, timeout: int, expect: str,
                          on_progress=None, base_agent_cnt: int = 0,
                          base_att_cnt: int = 0, stop_event=None, baseline_sources=None) -> dict | None:
@@ -807,6 +833,7 @@ class MuseEngine:
         t_start = time.time()
         stable_src, stable_n = "", 0
         last_txt, txt_stable = "", 0
+        next_session_check = t_start + 10.0
         while time.time() < deadline:
             if stop_event is not None and stop_event.is_set():
                 raise MuseGenerationError("客户端已断开连接，终止生成任务")
@@ -857,6 +884,12 @@ class MuseEngine:
                         stable_src, stable_n = check_src, 0
                     if stable_n >= 1:
                         return att
+            # 会话在 Muse 端已被中断/失败时立即结束，不再等到超时
+            if time.time() >= next_session_check:
+                next_session_check = time.time() + 8.0
+                status = self._muse_session_status()
+                if status in self.STOPPED_SESSION_STATUSES:
+                    raise MuseSessionStopped(status)
             elapsed = time.time() - t_start
             if on_progress:
                 prog = min(92, int(25 + elapsed * 1.0))

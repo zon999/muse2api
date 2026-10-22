@@ -45,7 +45,8 @@ from fastapi.responses import (FileResponse, HTMLResponse, JSONResponse,
 from pydantic import BaseModel, Field
 
 from config import CFG
-from engine import ESSENTIAL_COOKIES, MuseAuthError, MuseEngine, MuseGenerationError
+from engine import (ESSENTIAL_COOKIES, MuseAuthError, MuseEngine, MuseGenerationError,
+                    MuseSessionStopped)
 from store import Store, account_expiry, min_expiry
 
 import sys
@@ -921,6 +922,9 @@ def _run_generation_locked(prompt: str, kind: str, timeout: int,
                 raise MuseGenerationError("任务总等待时限已到，停止重试")
             if attempt > 0:
                 if last_exc and "未产出媒体附件，仅返回了文本回复" in str(last_exc):
+                    break
+                # 会话被人为中断（在 Muse 里点了停止）时不换号重试
+                if isinstance(last_exc, MuseSessionStopped) and last_exc.status == "interrupted":
                     break
                 old_id = cur_acc["id"] if cur_acc else None
                 if old_id:
