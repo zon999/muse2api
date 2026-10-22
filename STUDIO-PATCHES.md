@@ -22,6 +22,8 @@ browser-based media test). No test touches a real Muse account.
 | Resume | Muse thread id + account stored on the task; on startup the thread is reopened to fetch the result | `8f4ce03` | Verified: engine stopped mid-video, restarted, same thread's video fetched |
 | Readiness | `/readyz` reports `version` | `74b0526` | Offline only |
 | Browser lifecycle | One Chromium even when jobs start concurrently; a reattached browser is closed on stop | `cb7fa8d` | Verified: no Chrome left after shutdown |
+| Readiness | `/readyz` reports `concurrency` and `account_concurrency` | `baa1097` | Offline only |
+| Video idempotency | `POST /v1/videos` honours `Idempotency-Key` like image tasks (same key → same task; different body → 409) | (this commit) | Offline only |
 
 Quota stays on upstream's UI scraping: the server action HaoHao used no longer exists on Muse.
 

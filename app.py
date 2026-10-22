@@ -1294,14 +1294,33 @@ def cancel_task(task_id: str, _=Depends(auth)):
 # ------------------------- 生视频（异步任务） -------------------------
 @app.post("/v1/videos")
 @app.post("/v1/videos/generations")
-async def create_video(req: VideoRequest, _=Depends(auth)):
+async def create_video(req: VideoRequest, idempotency_key: str | None = Header(default=None),
+                       _=Depends(auth)):
     ref_img = collect_reference_images(req.reference_images, req.reference_image,
                                        req.image_url, req.image) or None
 
     prompt = build_video_prompt(req)
     timeout = req.timeout or CFG.video_timeout
-    task = store.create_task("video", req.prompt)
-    store.update_task(task["id"], api_prompt=prompt)
+    if not isinstance(idempotency_key, str):  # direct calls outside FastAPI pass the Header default
+        idempotency_key = None
+    if idempotency_key and len(idempotency_key) > 256:
+        raise HTTPException(400, "Idempotency-Key too long")
+    key_hash = hashlib.sha256(idempotency_key.encode()).hexdigest() if idempotency_key else None
+    request_hash = hashlib.sha256(json.dumps(
+        {"request": req.model_dump(by_alias=True), "reference": ref_img},
+        sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+    with IMAGE_TASK_LOCK:
+        if key_hash:
+            for existing in list(store.tasks.values()):
+                if existing.get("video_request_key") == key_hash:
+                    if existing.get("video_request_hash") != request_hash:
+                        raise HTTPException(409, "Idempotency-Key reused with different request")
+                    return {"id": existing["id"], "task_id": existing["id"], "object": "video.task",
+                            "status": existing["status"], "progress": existing.get("progress", 0),
+                            "created_at": existing["created_at"]}
+        task = store.create_task("video", req.prompt)
+        store.update_task(task["id"], api_prompt=prompt,
+                          video_request_key=key_hash, video_request_hash=request_hash)
 
     store.update_task(task["id"], progress=10)
     stop_event = TASK_CANCEL[task["id"]] = threading.Event()
