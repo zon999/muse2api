@@ -101,3 +101,10 @@ def test_media_public_by_default_and_protected_when_enabled():
         status, _, body = asyncio.run(call(module.app, "GET", "/v1/media/a.webp",
                                            {"authorization": "Bearer test-secret"}))
         assert status == 200 and body == b"img"
+
+
+def test_readyz_reports_version():
+    with tempfile.TemporaryDirectory(prefix="muse-hardening-") as tmp:
+        module = load_app(tmp)
+        status, _, body = asyncio.run(call(module.app, "GET", "/readyz"))
+        assert status == 200 and json.loads(body)["version"] == module.app.version

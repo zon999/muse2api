@@ -1038,7 +1038,8 @@ def readyz():
     accs = [a for a in store.list_accounts() if a.get("enabled", True)]
     return {"status": "ready" if accs else "no_account",
             "accounts": len(accs),
-            "browser_running": bool(engine.proc and engine.proc.poll() is None)}
+            "browser_running": bool(engine.proc and engine.proc.poll() is None),
+            "version": app.version}
 
 
 @app.get("/v1/models")
