@@ -62,7 +62,7 @@ def test_interrupted_generation_is_not_retried_on_another_account():
     used = []
 
     def fake_generate(cookies, prompt, expect, timeout, expires=None, account_id=None,
-                      on_progress=None, reference_image=None, stop_event=None):
+                      on_progress=None, reference_image=None, stop_event=None, on_session=None):
         used.append(account_id)
         raise engine_module.MuseSessionStopped("interrupted")
 

@@ -910,18 +910,22 @@ def _pos(v) -> bool:
         return False
 
 
-def _run_generation(prompt: str, kind: str, timeout: int,
-                    account_id: str | None = None, on_progress=None,
-                    reference_image: str | list | None = None,
-                    on_acquired=None, stop_event=None) -> tuple[dict, str | None]:
-    # Browser ownership covers account selection, retry and cleanup, not just generate().
-    deadline = time.monotonic() + max(1, timeout)
-    # 排队时分段等待，以便在拿到浏览器槽位前也能响应取消
+def _acquire_gen_slot(deadline: float, stop_event=None):
+    """排队等浏览器槽位；分段等待，以便在拿到槽位前也能响应取消。"""
     while not GEN_LOCK.acquire(timeout=min(1.0, max(0.05, deadline - time.monotonic()))):
         if stop_event is not None and stop_event.is_set():
             raise MuseSessionStopped("cancelled")
         if time.monotonic() >= deadline:
             raise MuseGenerationError("等待浏览器队列超时，请稍后重试")
+
+
+def _run_generation(prompt: str, kind: str, timeout: int,
+                    account_id: str | None = None, on_progress=None,
+                    reference_image: str | list | None = None,
+                    on_acquired=None, stop_event=None, on_session=None) -> tuple[dict, str | None]:
+    # Browser ownership covers account selection, retry and cleanup, not just generate().
+    deadline = time.monotonic() + max(1, timeout)
+    _acquire_gen_slot(deadline, stop_event)
     try:
         if stop_event is not None and stop_event.is_set():
             raise MuseSessionStopped("cancelled")
@@ -932,7 +936,7 @@ def _run_generation(prompt: str, kind: str, timeout: int,
                 pass
         return _run_generation_locked(prompt, kind, timeout, account_id,
                                       on_progress, reference_image, deadline=deadline,
-                                      stop_event=stop_event)
+                                      stop_event=stop_event, on_session=on_session)
     finally:
         GEN_LOCK.release()
 
@@ -940,7 +944,7 @@ def _run_generation(prompt: str, kind: str, timeout: int,
 def _run_generation_locked(prompt: str, kind: str, timeout: int,
                     account_id: str | None = None, on_progress=None,
                     reference_image: str | list | None = None, deadline=None,
-                    stop_event=None) -> tuple[dict, str | None]:
+                    stop_event=None, on_session=None) -> tuple[dict, str | None]:
     remaining_wait = int(deadline - time.monotonic()) if deadline is not None else timeout
     preferred_id = getattr(engine, "current_acc_id", None)
     if kind == "video" and not account_id:
@@ -994,7 +998,9 @@ def _run_generation_locked(prompt: str, kind: str, timeout: int,
                 res = engine.generate(cur_acc["cookies"], prompt, expect=kind,
                                       timeout=remaining, expires=cur_acc.get("cookies_exp"),
                                       account_id=cur_acc["id"], on_progress=on_progress,
-                                      reference_image=reference_image, stop_event=stop_event)
+                                      reference_image=reference_image, stop_event=stop_event,
+                                      on_session=(lambda sid, aid=cur_acc["id"]: on_session(aid, sid))
+                                      if on_session else None)
                 store.mark(cur_acc["id"], True, "")
                 _sync_cookies(cur_acc["id"])
                 return res, cur_acc["id"]
@@ -1095,13 +1101,8 @@ def _queue_image(req: ImageRequest, prompt: str, reference_image: list | None,
                 prompt, "image", req.timeout or CFG.image_timeout,
                 reference_image=reference_image,
                 on_progress=lambda p: store.update_task(tid, progress=p),
-                on_acquired=_on_acquired, stop_event=stop_event)
-            # Store only media metadata, not large base64 payloads or reference credentials.
-            store.update_task(tid, status="completed", progress=100, account=acc_id,
-                              elapsed=round(time.time() - timing["t0"], 1),
-                              url=media_url(res["filename"]),
-                              result={**{k: res[k] for k in ("filename", "size", "kind")},
-                                      "url": media_url(res["filename"])})
+                on_acquired=_on_acquired, stop_event=stop_event, on_session=_record_session(tid))
+            _finish_task_success(tid, "image", res, acc_id, timing["t0"])
         except Exception as exc:  # noqa: BLE001
             _finish_failed_task(tid, exc, stop_event, timing["t0"])
         finally:
@@ -1235,6 +1236,25 @@ async def images_edits(request: Request, _=Depends(auth)):
     return _image_response(req_obj, res)
 
 
+def _finish_task_success(tid: str, kind: str, res: dict, acc_id: str | None, t0: float):
+    """保存成功结果；只存媒体元数据，不存大段 base64 或参考图。"""
+    url = media_url(res["filename"])
+    common = dict(status="completed", progress=100, account=acc_id,
+                  elapsed=round(time.time() - t0, 1), url=url)
+    if kind == "image":
+        store.update_task(tid, **common,
+                          result={**{k: res[k] for k in ("filename", "size", "kind")}, "url": url})
+    else:
+        store.update_task(tid, **common, video={"url": url},
+                          result={"url": url, "filename": res["filename"],
+                                  "bytes": res["size"], "kind": res["kind"]})
+
+
+def _record_session(tid: str):
+    """生成开始后记录 Muse 线程 id 与账号，服务重启后据此找回结果。"""
+    return lambda acc_id, sid: store.update_task(tid, account=acc_id, muse_session=sid)
+
+
 def _finish_failed_task(tid: str, exc: Exception, stop_event, t0: float):
     """任务异常结束：用户取消的记为 cancelled，其余记为 failed。"""
     elapsed = round(time.time() - t0, 1)
@@ -1293,15 +1313,8 @@ async def create_video(req: VideoRequest, _=Depends(auth)):
                 store.update_task(task["id"], progress=p)
             res, acc_id = _run_generation(prompt, "video", timeout, on_progress=prog_cb,
                                           reference_image=ref_img, on_acquired=_on_acquired,
-                                          stop_event=stop_event)
-            vurl = media_url(res["filename"])
-            store.update_task(task["id"], status="completed", progress=100, account=acc_id,
-                              elapsed=round(time.time() - timing["t0"], 1),
-                              url=vurl,
-                              video={"url": vurl},
-                              result={"url": vurl,
-                                      "filename": res["filename"],
-                                      "bytes": res["size"], "kind": res["kind"]})
+                                          stop_event=stop_event, on_session=_record_session(task["id"]))
+            _finish_task_success(task["id"], "video", res, acc_id, timing["t0"])
         except Exception as exc:  # noqa: BLE001
             _finish_failed_task(task["id"], exc, stop_event, timing["t0"])
         finally:
@@ -2557,11 +2570,54 @@ async def admin_repo_push(payload: dict = Body(default={}), _=Depends(auth)):
     return await asyncio.to_thread(_do_push)
 
 
+def _start_resume(task: dict):
+    """服务重启前已发送到 Muse 的任务：回到原线程取结果，而不是直接判失败。"""
+    tid, kind = task["id"], task["kind"]
+    timeout = CFG.video_timeout if kind == "video" else CFG.image_timeout
+    stop_event = TASK_CANCEL[tid] = threading.Event()
+    store.update_task(tid, status="processing", error=None)
+    log.info("恢复重启前的任务 %s（%s）", tid, kind)
+
+    def worker():
+        t0 = time.time()
+        acc_id = task["account"]
+        deadline = time.monotonic() + timeout
+        try:
+            _acquire_gen_slot(deadline, stop_event)
+            try:
+                ACCOUNT_POOL.acquire(account_id=acc_id, timeout=max(1, deadline - time.monotonic()),
+                                     stop_event=stop_event)
+                try:
+                    acc = _renew_and_persist(acc_id, wake_vm=True) or store.get_account(acc_id)
+                    engine.start()
+                    res = engine.resume(acc["cookies"], task["muse_session"], expect=kind,
+                                        timeout=max(1, int(deadline - time.monotonic())),
+                                        expires=acc.get("cookies_exp"), account_id=acc_id,
+                                        on_progress=lambda p: store.update_task(tid, progress=p),
+                                        stop_event=stop_event)
+                    _sync_cookies(acc_id)
+                    _finish_task_success(tid, kind, res, acc_id, t0)
+                finally:
+                    ACCOUNT_POOL.release(acc_id)
+                    engine.close_current_page()
+            finally:
+                GEN_LOCK.release()
+        except Exception as exc:  # noqa: BLE001
+            _finish_failed_task(tid, exc, stop_event, t0)
+        finally:
+            TASK_CANCEL.pop(tid, None)
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
 @app.on_event("startup")
 async def _startup():
     for task in list(store.tasks.values()):
         if task.get("kind") in ("image", "video") and task.get("status") in ("queued", "processing"):
-            store.update_task(task["id"], status="failed", error="服务重启中断了任务，请重新提交")
+            if task.get("muse_session") and store.get_account(task.get("account") or ""):
+                _start_resume(task)
+            else:
+                store.update_task(task["id"], status="failed", error="服务重启中断了任务，请重新提交")
     if not CFG.api_key:
         import secrets
         new_key = "m2a_" + secrets.token_hex(24)

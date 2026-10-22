@@ -123,7 +123,7 @@ def test_cancel_running_video_task():
     started, calls = threading.Event(), []
 
     def fake_generate(cookies, prompt, expect, timeout, expires=None, account_id=None,
-                      on_progress=None, reference_image=None, stop_event=None):
+                      on_progress=None, reference_image=None, stop_event=None, on_session=None):
         calls.append(account_id)
         started.set()
         while not stop_event.is_set():

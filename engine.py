@@ -817,6 +817,16 @@ class MuseEngine:
       return s ? String(s.status || '') : '';
     })()"""
     STOPPED_SESSION_STATUSES = ("interrupted", "failed", "error", "cancelled", "canceled")
+    _THREAD_ID_JS = "(location.pathname.match(/^\\/thread\\/([^\\/?#]+)/) || [])[1] || ''"
+    _THREAD_ID_RE = re.compile(r"[A-Za-z0-9_-]{6,80}")
+
+    def _thread_id(self) -> str:
+        """当前页面的 Muse 线程 id（/thread/<id>）；新会话页或读不到时返回空串。"""
+        try:
+            tid = self.page.js(self._THREAD_ID_JS)
+        except Exception:  # noqa: BLE001
+            return ""
+        return tid if isinstance(tid, str) and self._THREAD_ID_RE.fullmatch(tid) else ""
 
     _STOP_JS = r"""(function(){
       var b = document.querySelector('[data-testid="hatch-composer-stop-button"]')
@@ -843,7 +853,8 @@ class MuseEngine:
 
     def _wait_attachment(self, baseline_src: str, timeout: int, expect: str,
                          on_progress=None, base_agent_cnt: int = 0,
-                         base_att_cnt: int = 0, stop_event=None, baseline_sources=None) -> dict | None:
+                         base_att_cnt: int = 0, stop_event=None, baseline_sources=None,
+                         on_session=None) -> dict | None:
         baseline_sources = set(baseline_sources or ()) | {baseline_src}
         deadline = time.time() + timeout
         t_start = time.time()
@@ -855,6 +866,15 @@ class MuseEngine:
                 log.info("任务已取消，停止 Muse 会话: %s", self.stop_generation())
                 raise MuseSessionStopped("cancelled")
             time.sleep(0.6)
+            if on_session is not None:
+                # 线程 id 一出现就上报，服务重启后可凭它找回结果
+                sid = self._thread_id()
+                if sid and sid != "new":
+                    try:
+                        on_session(sid)
+                    except Exception:  # noqa: BLE001
+                        pass
+                    on_session = None
             self._scroll_bottom()
             atts = self.attachments()
             # 严格按期望类型挑选附件，绝不接受跨模态兜底（如将视频请求降级为图片封面）
@@ -1328,7 +1348,7 @@ class MuseEngine:
     def generate(self, cookies: dict, prompt: str, expect: str = "image",
                  timeout: int = 240, expires: dict | None = None, account_id: str | None = None,
                  on_progress=None, reference_image: str | list | None = None,
-                 stop_event=None) -> dict:
+                 stop_event=None, on_session=None) -> dict:
         deadline = time.monotonic() + timeout
         self.ensure_page(cookies, expires, account_id=account_id)
         self.reset_thread(for_chat=False)
@@ -1351,12 +1371,38 @@ class MuseEngine:
         att = self._wait_attachment(
             baseline_src, max(0, deadline - time.monotonic()), expect, on_progress=on_progress,
             base_agent_cnt=base_agent_cnt, base_att_cnt=len(atts_before),
-            stop_event=stop_event, baseline_sources=baseline_sources
+            stop_event=stop_event, baseline_sources=baseline_sources, on_session=on_session
         )
         if not att:
             self._debug_dump("no-attachment")
             raise MuseGenerationError("等待生成超时，未出现新的生成结果")
+        return self._save_attachment(att, expect)
 
+    def resume(self, cookies: dict, session_id: str, expect: str = "image",
+               timeout: int = 240, expires: dict | None = None, account_id: str | None = None,
+               on_progress=None, stop_event=None) -> dict:
+        """服务重启后重新打开原 Muse 线程取结果：已完成直接取回，仍在生成则继续等待，
+        已中断/失败则由会话状态检查立即结束。"""
+        if not self._THREAD_ID_RE.fullmatch(session_id or ""):
+            raise MuseGenerationError("无效的 Muse 会话 id")
+        self.ensure_page(cookies, expires, account_id=account_id)
+        self.page.send("Page.navigate", {"url": f"https://muse.ai/thread/{session_id}"})
+        t_end = time.time() + 15.0
+        while time.time() < t_end:
+            time.sleep(0.3)
+            if self._thread_id() == session_id and self.page.js("document.readyState === 'complete'"):
+                break
+        else:
+            raise MuseGenerationError("无法打开原 Muse 会话")
+        self._wait_ws_ready(self.page, timeout=12.0)
+        att = self._wait_attachment("", timeout, expect, on_progress=on_progress,
+                                    stop_event=stop_event)
+        if not att:
+            raise MuseGenerationError("等待生成超时，未出现新的生成结果")
+        return self._save_attachment(att, expect)
+
+    def _save_attachment(self, att: dict, expect: str) -> dict:
+        """把选中的成品附件取回并保存到媒体目录。"""
         os.makedirs(self.cfg.media_dir, exist_ok=True)
         data = mime = url = None
         selected_src = (att.get("vSrc") if expect == "video" else None) or att.get("src") or ""
