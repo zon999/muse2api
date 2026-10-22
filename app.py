@@ -1218,6 +1218,17 @@ def _finish_failed_task(tid: str, exc: Exception, stop_event, t0: float):
         store.update_task(tid, status="failed", error=str(exc), elapsed=elapsed)
 
 
+@app.get("/v1/tasks/{task_id}")
+def get_task(task_id: str, _=Depends(auth)):
+    """生图/生视频任务的统一查询入口，返回与各自查询接口相同的结构。"""
+    task = store.get_task(task_id)
+    if not task:
+        raise HTTPException(404, "task 不存在")
+    if task.get("kind") == "image":
+        return get_image_task(task_id)
+    return get_video(task_id)
+
+
 @app.post("/v1/tasks/{task_id}/cancel")
 def cancel_task(task_id: str, _=Depends(auth)):
     """取消排队中或生成中的生图/生视频任务；生成中会点击 Muse 的停止按钮结束会话。"""

@@ -179,3 +179,22 @@ def test_cancel_queued_image_task_never_reaches_muse():
 
     run_with(patches, scenario)
     assert calls == []
+
+
+def test_unified_task_lookup():
+    app = app_module()
+    with patch("store._write", lambda *a, **k: None):
+        img = app.store.create_task("image", "p")
+        app.store.update_task(img["id"], status="completed", progress=100, response_format="url",
+                              result={"filename": "a.png", "size": 1, "kind": "image",
+                                      "url": "http://x/v1/media/a.png"})
+        vid = app.store.create_task("video", "p")
+        app.store.update_task(vid["id"], status="cancelled", error="任务已取消")
+
+    status, body = request("GET", f"/v1/tasks/{img['id']}")
+    assert status == 200 and body["kind"] == "image" and body["status"] == "completed"
+    assert body["data"][0]["url"].endswith("/v1/media/a.png"), body
+    status, body = request("GET", f"/v1/tasks/{vid['id']}")
+    assert status == 200 and body["kind"] == "video" and body["status"] == "cancelled"
+    status, _ = request("GET", "/v1/tasks/does-not-exist")
+    assert status == 404
