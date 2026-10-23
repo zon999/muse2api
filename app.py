@@ -89,40 +89,48 @@ app.add_middleware(CORSMiddleware,
 
 store = Store(CFG)
 engine = MuseEngine(CFG)
+engine.load_limit = lambda: store.load_slots
 engine.proxy_resolver = lambda aid: (store.get_account(aid) or {}).get("proxy_url") or None
 
 
 class ConcurrencyLock:
     """多账号并发调度锁。
-    由 CFG.max_concurrency 限制最大并发槽位；
+    并发槽位数来自 limit_fn（运行时可变：设置里手动指定，或按可用账号数自动取值）；
     同时提供与标准 Lock 兼容的 acquire / release / locked 接口，
     确保向下兼容历史单锁断言与管理端操作。"""
-    def __init__(self, limit: int = 2):
-        self.limit = max(1, limit)
-        self._sem = threading.Semaphore(self.limit)
-        self._count_lock = threading.Lock()
+    def __init__(self, limit_fn):
+        self._limit_fn = limit_fn
+        self._cond = threading.Condition()
         self._active_count = 0
 
+    @property
+    def limit(self) -> int:
+        return max(1, int(self._limit_fn()))
+
     def acquire(self, blocking: bool = True, timeout: float | None = -1) -> bool:
-        if timeout is None:
-            timeout = -1
-        if timeout < 0:
-            ok = self._sem.acquire(blocking=blocking)
-        else:
-            ok = self._sem.acquire(blocking=blocking, timeout=timeout)
-        if ok:
-            with self._count_lock:
-                self._active_count += 1
-        return ok
+        deadline = None if timeout is None or timeout < 0 else time.monotonic() + timeout
+        with self._cond:
+            while self._active_count >= self.limit:
+                if not blocking:
+                    return False
+                if deadline is None:
+                    self._cond.wait(timeout=1.0)  # 周期性复查：上限可能被调大
+                else:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        return False
+                    self._cond.wait(timeout=min(remaining, 1.0))
+            self._active_count += 1
+            return True
 
     def release(self):
-        with self._count_lock:
+        with self._cond:
             if self._active_count > 0:
                 self._active_count -= 1
-        self._sem.release()
+            self._cond.notify()
 
     def locked(self) -> bool:
-        with self._count_lock:
+        with self._cond:
             return self._active_count > 0
 
     def __enter__(self):
@@ -136,11 +144,18 @@ class ConcurrencyLock:
 class AccountPoolManager:
     """账号并发管理器：每个账号最多同时跑 per_account 个任务（每个任务有独立的浏览器上下文），
     优先把任务分给空闲账号，所有账号都在忙时才在同一账号上叠加。"""
-    def __init__(self, store_instance, per_account: int = 1):
+    def __init__(self, store_instance):
         self.store = store_instance
-        self.per_account = max(1, per_account)
         self.busy_accounts: dict[str, int] = {}
         self.cond = threading.Condition()
+
+    @property
+    def per_account(self) -> int:
+        return self.store.per_account
+
+    @property
+    def max_accounts(self) -> int:
+        return self.store.max_accounts
 
     def _take(self, account_id: str):
         self.busy_accounts[account_id] = self.busy_accounts.get(account_id, 0) + 1
@@ -164,12 +179,18 @@ class AccountPoolManager:
                     acc = self.store.get_account(account_id)
                     if not acc or not acc.get("enabled", True):
                         raise MuseAuthError(f"指定账号 {account_id} 不存在或已禁用")
-                    if account_id not in self._full_ids():
+                    cap_hit = account_id not in self.busy_accounts and len(self.busy_accounts) >= self.max_accounts
+                    if account_id not in self._full_ids() and not cap_hit:
                         self._take(account_id)
                         return acc
                 else:
                     # 先只看完全空闲的账号，没有再看未满额的账号
-                    for blocked in (set(self.busy_accounts), self._full_ids()):
+                    cap_hit = len(self.busy_accounts) >= self.max_accounts
+                    idle_ids = {a["id"] for a in self.store.accounts if a["id"] not in self.busy_accounts}
+                    # 同时工作的账号数已满：只能叠加在正在工作的账号上
+                    for blocked in (set(self.busy_accounts), self._full_ids() | (idle_ids if cap_hit else set())):
+                        if cap_hit and blocked == set(self.busy_accounts):
+                            continue
                         pref = preferred_id if preferred_id not in blocked else None
                         acc = self.store.pick_account(
                             preferred_id=pref,
@@ -202,8 +223,8 @@ class AccountPoolManager:
             self.cond.notify_all()
 
 
-GEN_LOCK = ConcurrencyLock(limit=CFG.max_concurrency)
-ACCOUNT_POOL = AccountPoolManager(store, per_account=CFG.account_concurrency)
+GEN_LOCK = ConcurrencyLock(store.concurrency_limit)
+ACCOUNT_POOL = AccountPoolManager(store)
 IMAGE_TASK_LOCK = threading.Lock()
 # 进行中的生图/生视频任务的取消信号：task_id -> Event
 TASK_CANCEL: dict[str, threading.Event] = {}
@@ -1045,8 +1066,9 @@ def readyz():
             "accounts": len(accs),
             "browser_running": bool(engine.proc and engine.proc.poll() is None),
             "version": app.version,
-            "concurrency": CFG.max_concurrency,
-            "account_concurrency": CFG.account_concurrency}
+            "concurrency": GEN_LOCK.limit,
+            "account_concurrency": store.per_account,
+            "max_accounts": store.max_accounts}
 
 
 @app.get("/v1/models")
@@ -1726,6 +1748,29 @@ def admin_status(_=Depends(auth)):
 @app.get("/admin/accounts")
 def list_accounts(_=Depends(auth)):
     return {"accounts": store.list_accounts(), "stats": store.stats()}
+
+
+def _pool_settings() -> dict:
+    return {"every": store.rotate_every, "perAccount": store.per_account, "maxAccounts": store.max_accounts, "loadSlots": store.load_slots,
+            "effective": GEN_LOCK.limit}
+
+
+@app.get("/admin/rotation")
+def get_rotation(_=Depends(auth)):
+    return _pool_settings()
+
+
+@app.post("/admin/rotation")
+def set_rotation(body: dict = Body(...), _=Depends(auth)):
+    """every：每个账号连续处理几次请求后换号；perAccount：每账号同时任务数；maxAccounts：同时工作的账号数。"""
+    for key in ("every", "perAccount", "maxAccounts", "loadSlots"):
+        v = body.get(key)
+        if v is not None and (not isinstance(v, int) or isinstance(v, bool)):
+            raise HTTPException(400, f"{key} 必须是整数")
+    if body.get("every") is not None:
+        store.set_rotate_every(body["every"])
+    store.set_pool_limits(body.get("perAccount"), body.get("maxAccounts"), body.get("loadSlots"))
+    return _pool_settings()
 
 
 @app.post("/admin/accounts")

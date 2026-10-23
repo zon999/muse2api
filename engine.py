@@ -59,12 +59,35 @@ class MuseSessionStopped(MuseGenerationError):
         self.status = status
 
 
+class LoadGate:
+    """限制同时「加载 muse.ai 页面」的标签数（加载阶段最吃网络）；页面就绪后生成阶段不受限。上限可在运行时调整。"""
+    def __init__(self, limit_fn):
+        self._limit_fn = limit_fn
+        self._cond = threading.Condition()
+        self._active = 0
+
+    def __enter__(self):
+        with self._cond:
+            while self._active >= max(1, int(self._limit_fn())):
+                self._cond.wait(timeout=1.0)
+            self._active += 1
+        return self
+
+    def __exit__(self, *exc):
+        with self._cond:
+            self._active -= 1
+            self._cond.notify()
+
+
 class MuseEngine:
     # account id -> proxy URL (or None); app.py sets it so every browser/HTTP call follows the account's proxy
     proxy_resolver = None
+    # app.py sets it: how many tabs may load muse.ai at once (None = no limit)
+    load_limit = None
 
     def __init__(self, cfg):
         self.cfg = cfg
+        self._load_gate = LoadGate(lambda: self.load_limit() if self.load_limit else 1_000)
         self.proc: subprocess.Popen | None = None
         self.browser: CDP | None = None
         self._local = threading.local()
@@ -508,28 +531,37 @@ class MuseEngine:
             except Exception as e:
                 log.warning("预续签 /api/session 失败（继续尝试浏览器加载）: %s", e)
 
-        page = self._open_page(proxy_url)
-        self._apply_cookies(page, cookies, expires)
-        page.send("Page.navigate", {"url": "https://muse.ai/thread/new"})
-        self.page = page  # Cleanup must also own pages that never become ready.
-        if self._wait_ws_ready(page, timeout=self.cfg.login_wait):
-            self.current_acc_id = account_id
-            self.current_proxy = proxy_url
-            return page
-        if proxy_url and not self.proxy_reachable(proxy_url):
-            self._close_page()
-            raise MuseProxyError("页面加载失败且代理无法访问 muse.ai")
-        try:
-            body = (page.js("document.body ? document.body.innerText.slice(0,1200) : ''") or "").lower()
-        except Exception:
-            body = ""
-        self._close_page()
-        if "connecting..." in body:
-            raise MuseGenerationError("页面网关连接超时 (Connecting...)，正在自动切换账号")
-        # Distinguish an expired session from a page that never became ready.
-        if re.search(r"log in|sign in|create an account|登录|use another account", body):
-            raise MuseAuthError("会话已被 muse.ai 登出（可能被其它登录挤掉或触发风控），"
-                                "请用浏览器扩展重新导入 cookie")
+        attempts = 2
+        for attempt in range(attempts):
+            last = attempt == attempts - 1
+            # opening muse.ai is the network-heavy step: only a few tabs load at once, the rest wait their turn
+            with self._load_gate:
+                page = self._open_page(proxy_url)
+                self._apply_cookies(page, cookies, expires)
+                page.send("Page.navigate", {"url": "https://muse.ai/thread/new"})
+                self.page = page  # Cleanup must also own pages that never become ready.
+                wait = self.cfg.login_wait if attempt == 0 else self.cfg.login_wait * 1.5
+                if self._wait_ws_ready(page, timeout=wait):
+                    self.current_acc_id = account_id
+                    self.current_proxy = proxy_url
+                    return page
+                if proxy_url and not self.proxy_reachable(proxy_url):
+                    self._close_page()
+                    raise MuseProxyError("页面加载失败且代理无法访问 muse.ai")
+                try:
+                    body = (page.js("document.body ? document.body.innerText.slice(0,1200) : ''") or "").lower()
+                except Exception:
+                    body = ""
+                self._close_page()
+            if "connecting..." in body:
+                raise MuseGenerationError("页面网关连接超时 (Connecting...)，正在自动切换账号")
+            # Distinguish an expired session from a page that never became ready.
+            if re.search(r"log in|sign in|create an account|登录|use another account", body):
+                raise MuseAuthError("会话已被 muse.ai 登出（可能被其它登录挤掉或触发风控），"
+                                    "请用浏览器扩展重新导入 cookie")
+            if not last:
+                log.warning("muse.ai 页面首次加载超时，稍等后重试一次（更长等待）")
+                time.sleep(2.0)
         raise MuseGenerationError("muse.ai 页面加载超时（未出现聊天输入框），请检查服务器网络后重试；未确认会话失效")
 
     def close_current_page(self):

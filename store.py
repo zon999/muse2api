@@ -74,6 +74,12 @@ def account_expiry(cookies_exp: dict | None,
     return min_expiry(ce)
 
 
+ROTATE_MIN, ROTATE_MAX, ROTATE_DEFAULT = 1, 50, 5
+LOAD_SLOTS_MAX, LOAD_SLOTS_DEFAULT = 8, 3  # 同时加载页面的标签数
+THREADS_MIN, THREADS_MAX = 1, 5  # 每账号并发任务数
+ACCOUNTS_AT_ONCE_MAX = 5  # 同时工作的账号数上限
+
+
 def _read(path: str, default):
     if not os.path.isfile(path):
         return default
@@ -160,6 +166,58 @@ class Store:
             if _is_pos(ce.get("hatch_vml")):
                 a["expires_at"] = int(ce["hatch_vml"])
         self.tasks: dict[str, dict] = _read(cfg.tasks_file, {})
+        self.rotate_every = self._load_rotate_every()
+        self._load_pool_limits()
+
+    def _load_rotate_every(self) -> int:
+        saved = _read(self.cfg.rotation_file, {}).get("every")
+        if isinstance(saved, int) and not isinstance(saved, bool):
+            return min(max(saved, ROTATE_MIN), ROTATE_MAX)
+        try:
+            return min(max(int(os.environ.get("MUSE2API_ROTATE_EVERY", "")), ROTATE_MIN), ROTATE_MAX)
+        except ValueError:
+            return ROTATE_DEFAULT
+
+    def _load_pool_limits(self):
+        saved = _read(self.cfg.rotation_file, {})
+
+        def pick(key: str, lo: int, hi: int, default: int) -> int:
+            v = saved.get(key)
+            return min(max(v, lo), hi) if isinstance(v, int) and not isinstance(v, bool) else default
+
+        env_default = min(max(getattr(self.cfg, "account_concurrency", 2), THREADS_MIN), THREADS_MAX)
+        self.per_account = pick("perAccount", THREADS_MIN, THREADS_MAX, env_default)
+        self.max_accounts = pick("maxAccounts", 1, ACCOUNTS_AT_ONCE_MAX, ACCOUNTS_AT_ONCE_MAX)
+        self.load_slots = pick("loadSlots", 1, LOAD_SLOTS_MAX, LOAD_SLOTS_DEFAULT)
+
+    def _save_pool_settings(self):
+        _write(self.cfg.rotation_file, {"every": self.rotate_every, "perAccount": self.per_account, "maxAccounts": self.max_accounts, "loadSlots": self.load_slots})
+
+    def set_rotate_every(self, n: int) -> int:
+        """每个账号连续处理多少次请求后换号；落盘，重启后保留。"""
+        n = min(max(int(n), ROTATE_MIN), ROTATE_MAX)
+        with _LOCK:
+            self.rotate_every = n
+            self._save_pool_settings()
+        return n
+
+    def set_pool_limits(self, per_account: int | None = None, max_accounts: int | None = None, load_slots: int | None = None):
+        """每个账号同时跑几个任务（1-5）、最多几个账号同时工作（1-5）；运行中立即生效，落盘。"""
+        with _LOCK:
+            if per_account is not None:
+                self.per_account = min(max(int(per_account), THREADS_MIN), THREADS_MAX)
+            if max_accounts is not None:
+                self.max_accounts = min(max(int(max_accounts), 1), ACCOUNTS_AT_ONCE_MAX)
+            if load_slots is not None:
+                self.load_slots = min(max(int(load_slots), 1), LOAD_SLOTS_MAX)
+            self._save_pool_settings()
+
+    def usable_accounts(self) -> int:
+        return sum(1 for a in self.accounts if a.get("enabled", True) and a.get("cookies"))
+
+    def concurrency_limit(self) -> int:
+        """同时运行的任务总数 = 同时工作的账号数 × 每账号任务数。"""
+        return max(1, min(self.usable_accounts(), self.max_accounts) * self.per_account)
 
     @property
     def _data_key(self) -> str:
@@ -249,7 +307,7 @@ class Store:
                 for a in live:
                     if a["id"] == preferred_id and a.get("ok") is not False:
                         sticky_n = getattr(self, "_sticky_count", 0) if getattr(self, "_sticky_id", None) == preferred_id else 0
-                        if not rotate or sticky_n < 15:
+                        if not rotate or sticky_n < self.rotate_every:
                             self._sticky_id = preferred_id
                             self._sticky_count = sticky_n + 1
                             if record_use:

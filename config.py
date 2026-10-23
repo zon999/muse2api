@@ -149,6 +149,10 @@ class Config:
         return os.path.join(self.data_dir, "accounts.json")
 
     @property
+    def rotation_file(self) -> str:
+        return os.path.join(self.data_dir, "rotation.json")
+
+    @property
     def tasks_file(self) -> str:
         return os.path.join(self.data_dir, "tasks.json")
 
