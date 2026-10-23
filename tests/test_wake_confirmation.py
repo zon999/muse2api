@@ -5,6 +5,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # engine.py imports proxy_support
 sys.modules['cdp'] = SimpleNamespace(CDP=object, http_json=lambda *args, **kwargs: {})
 engine_path = Path(sys.argv[1]) if len(sys.argv) > 1 else Path(__file__).resolve().parents[1] / 'engine.py'
 spec = importlib.util.spec_from_file_location('candidate_engine', engine_path)

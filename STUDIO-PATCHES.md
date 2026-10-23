@@ -23,6 +23,7 @@ browser-based media test). No test touches a real Muse account.
 | Readiness | `/readyz` reports `version` | `74b0526` | Offline only |
 | Browser lifecycle | One Chromium even when jobs start concurrently; a reattached browser is closed on stop | `cb7fa8d` | Verified: no Chrome left after shutdown |
 | Readiness | `/readyz` reports `concurrency` and `account_concurrency` | `baa1097` | Offline only |
+| Account proxy | Optional `proxy_url` per account: `requests` calls and the account's BrowserContext (`proxyServer`) use it; a proxied account never falls back to a plain tab; proxies with a password go through a loopback forwarder (`proxy_support.py`) | (this commit) | Chrome verified offline against a fake authenticating proxy; not run against a real proxy |
 | Video idempotency | `POST /v1/videos` honours `Idempotency-Key` like image tasks (same key → same task; different body → 409) | (this commit) | Offline only |
 
 Quota stays on upstream's UI scraping: the server action HaoHao used no longer exists on Muse.
@@ -46,6 +47,13 @@ Quota stays on upstream's UI scraping: the server action HaoHao used no longer e
 - `POST /v1/images/tasks`, `POST /v1/images/generations`, `POST /v1/videos` accept
   `reference_images: [dataURL | url | {url} | {b64_json} | {image_url}]`, merged with the older
   single-image fields; more than 6 images or more than 8MB inline → 400.
+- `PATCH /admin/accounts/{id}` accepts `proxy_url` (`http://`, `https://` or `socks5://`, no password for socks5;
+  `""` clears it). Account responses never contain the URL, only `has_proxy` and `proxy_host`.
+- `POST /admin/proxy/test` `{proxy_url, quick?}` → `{ok, ip, latency_ms, muse_reachable, muse_status, error}`.
+  With `quick: true` the proxy alone is probed (it is asked to open a tunnel to a neutral address, nothing is sent to
+  Muse or any web service); Studio's periodic health check uses it.
+- `POST /admin/proxy/tunnel` `{proxy_url}` → `{server}`: the address Chromium should use for that proxy.
+- Proxy failures raise `MuseProxyError`, whose text starts with `PROXY_ERROR:` and never contains the URL.
 - `/readyz` adds `version`.
 - New task status `cancelled`.
 

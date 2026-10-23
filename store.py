@@ -8,6 +8,8 @@ import threading
 import time
 import uuid
 
+from proxy_support import proxy_host
+
 _LOCK = threading.Lock()
 
 # 决定账号生死的核心 cookie（与 engine.ESSENTIAL_COOKIES 保持一致）
@@ -191,10 +193,18 @@ class Store:
             self._save_accounts()
             return acc
 
+    @staticmethod
+    def public_account(a: dict) -> dict:
+        """The account without secrets: no cookies and no proxy URL (it may hold a password)."""
+        item = {k: v for k, v in a.items() if k not in ("cookies", "proxy_url")}
+        item["has_proxy"] = bool(a.get("proxy_url"))
+        item["proxy_host"] = proxy_host(a.get("proxy_url"))
+        return item
+
     def list_accounts(self) -> list[dict]:
         out = []
         for a in self.accounts:
-            item = {k: v for k, v in a.items() if k != "cookies"}
+            item = self.public_account(a)
             ce = a.get("cookies_exp") or {}
             if _is_pos(ce.get("hatch_vml")):
                 item["expires_at"] = int(ce["hatch_vml"])

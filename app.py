@@ -45,6 +45,7 @@ from fastapi.responses import (FileResponse, HTMLResponse, JSONResponse,
 from pydantic import BaseModel, Field
 
 from config import CFG
+from proxy_support import parse_proxy_url, probe_proxy, requests_proxies
 from engine import (ESSENTIAL_COOKIES, MuseAuthError, MuseEngine, MuseGenerationError,
                     MuseSessionStopped)
 from store import Store, account_expiry, min_expiry
@@ -88,6 +89,7 @@ app.add_middleware(CORSMiddleware,
 
 store = Store(CFG)
 engine = MuseEngine(CFG)
+engine.proxy_resolver = lambda aid: (store.get_account(aid) or {}).get("proxy_url") or None
 
 
 class ConcurrencyLock:
@@ -322,7 +324,8 @@ def _renew_and_persist(acc_id: str, wake_vm: bool = True, force: bool = False) -
         engine._last_http_renew[acc_id] = last_sync
         return acc
     try:
-        res = engine.renew_session_http(acc["cookies"], acc.get("cookies_exp"), wake_vm=wake_vm)
+        res = engine.renew_session_http(acc["cookies"], acc.get("cookies_exp"), wake_vm=wake_vm,
+                                        proxy_url=acc.get("proxy_url") or None)
         engine._last_http_renew[acc_id] = now
         if res.get("cookies"):
             store.update_account(acc_id, cookies=res["cookies"],
@@ -521,6 +524,8 @@ class AccountRequest(BaseModel):
 class AccountPatch(BaseModel):
     label: str | None = None
     enabled: bool | None = None
+    # present with "" clears the proxy; absent leaves it alone
+    proxy_url: str | None = None
 
 
 # ------------------------- 参考图 -------------------------
@@ -1760,11 +1765,74 @@ def add_account(req: AccountRequest, _=Depends(auth)):
 
 @app.patch("/admin/accounts/{aid}")
 def patch_account(aid: str, req: AccountPatch, _=Depends(auth)):
-    acc = store.update_account(aid, label=req.label, enabled=req.enabled)
+    changes = {"label": req.label, "enabled": req.enabled}
+    if "proxy_url" in req.model_fields_set:
+        proxy = (req.proxy_url or "").strip()
+        if proxy:
+            try:
+                parse_proxy_url(proxy)
+            except ValueError as exc:
+                raise HTTPException(400, str(exc)) from None
+        changes["proxy_url"] = proxy  # "" is stored, not skipped, so it clears
+    acc = store.update_account(aid, **changes)
     if not acc:
         raise HTTPException(404, "账号不存在")
-    return {k: v for k, v in acc.items() if k != "cookies"} | {
-        "cookie_count": len(acc.get("cookies", {}))}
+    return store.public_account(acc) | {"cookie_count": len(acc.get("cookies", {}))}
+
+
+class ProxyTestRequest(BaseModel):
+    proxy_url: str
+    # health checks talk to the proxy only: it is asked to open a tunnel to a neutral address, nothing goes to Muse
+    quick: bool = False
+
+
+@app.post("/admin/proxy/test")
+def test_proxy(req: ProxyTestRequest, _=Depends(auth)):
+    """Checks a proxy through the same `requests` path the account renewal uses; never echoes the URL."""
+    try:
+        proxies = requests_proxies(req.proxy_url)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from None
+    import requests
+    out = {"ok": False, "ip": None, "latency_ms": None, "muse_reachable": False, "muse_status": None, "error": None}
+    started = time.monotonic()
+    if req.quick:
+        error = probe_proxy(req.proxy_url)
+        if error:
+            out["error"] = error
+            return out
+        out.update(ok=True, latency_ms=int((time.monotonic() - started) * 1000))
+        return out
+    try:
+        r = requests.get("https://api.ipify.org?format=json", timeout=12, proxies=proxies)
+        out["ip"] = str(r.json().get("ip") or "")[:64] or None
+        out["latency_ms"] = int((time.monotonic() - started) * 1000)
+    except requests.exceptions.ProxyError:
+        out["error"] = "proxy_refused"
+        return out
+    except requests.RequestException as exc:
+        out["error"] = "timeout" if isinstance(exc, requests.Timeout) else "network"
+        return out
+    except ValueError:
+        out["error"] = "bad_response"
+        return out
+    try:
+        m = requests.get("https://muse.ai/", timeout=12, allow_redirects=False, proxies=proxies)
+        out["muse_status"] = m.status_code
+        out["muse_reachable"] = m.status_code < 400
+    except requests.RequestException:
+        out["muse_reachable"] = False
+    out["ok"] = True
+    return out
+
+
+@app.post("/admin/proxy/tunnel")
+def proxy_tunnel(req: ProxyTestRequest, _=Depends(auth)):
+    """Local no-password proxy address for a proxy that needs a login (Studio's login browser uses it)."""
+    try:
+        return {"server": engine._tunnels.chrome_proxy_server(req.proxy_url)}
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from None
 
 
 @app.delete("/admin/accounts/{aid}")
@@ -1788,7 +1856,7 @@ async def test_account(aid: str, _=Depends(auth)):
         with GEN_LOCK:
             try:
                 engine.start()
-                engine.refresh(acc["cookies"], acc.get("cookies_exp"))
+                engine.refresh(acc["cookies"], acc.get("cookies_exp"), account_id=aid)
                 synced = _sync_cookies(aid)
                 quota = None
                 quota_error = None
@@ -1854,7 +1922,7 @@ def relogin(_=Depends(auth)):
         raise HTTPException(400, "没有可用账号")
     try:
         engine.start()
-        engine.refresh(acc["cookies"], acc.get("cookies_exp"))
+        engine.refresh(acc["cookies"], acc.get("cookies_exp"), account_id=acc["id"])
         return {"ok": True, "account": acc["id"]}
     except Exception as exc:  # noqa: BLE001
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=502)
@@ -2114,7 +2182,8 @@ def _probe_account_sync(aid: str, check_quota: bool = False) -> dict:
     if not acc or not acc.get("cookies"):
         return {"ok": False, "id": aid, "label": (acc or {}).get("label", aid), "error": "账号无有效 cookie"}
     try:
-        res = engine.renew_session_http(acc["cookies"], acc.get("cookies_exp"), wake_vm=True)
+        res = engine.renew_session_http(acc["cookies"], acc.get("cookies_exp"), wake_vm=True,
+                                        proxy_url=acc.get("proxy_url") or None)
         store.update_account(
             aid,
             cookies=res["cookies"],
@@ -2652,3 +2721,4 @@ async def _startup():
 @app.on_event("shutdown")
 def _shutdown():
     engine.stop()
+    engine._tunnels.close_all()

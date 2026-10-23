@@ -5,3 +5,4 @@ requests>=2.32
 websocket-client>=1.8
 python-multipart>=0.0.9
 cryptography>=42
+pysocks>=1.7
