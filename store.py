@@ -77,7 +77,7 @@ def account_expiry(cookies_exp: dict | None,
 ROTATE_MIN, ROTATE_MAX, ROTATE_DEFAULT = 1, 50, 5
 LOAD_SLOTS_MAX, LOAD_SLOTS_DEFAULT = 8, 3  # 同时加载页面的标签数
 THREADS_MIN, THREADS_MAX = 1, 5  # 每账号并发任务数
-ACCOUNTS_AT_ONCE_MAX = 5  # 同时工作的账号数上限
+ACCOUNTS_AT_ONCE_MAX = 10 # 同时工作的账号数上限
 
 
 def _read(path: str, default):
@@ -187,7 +187,7 @@ class Store:
 
         env_default = min(max(getattr(self.cfg, "account_concurrency", 2), THREADS_MIN), THREADS_MAX)
         self.per_account = pick("perAccount", THREADS_MIN, THREADS_MAX, env_default)
-        self.max_accounts = pick("maxAccounts", 1, ACCOUNTS_AT_ONCE_MAX, ACCOUNTS_AT_ONCE_MAX)
+        self.max_accounts = pick("maxAccounts", 1, ACCOUNTS_AT_ONCE_MAX, 5)
         self.load_slots = pick("loadSlots", 1, LOAD_SLOTS_MAX, LOAD_SLOTS_DEFAULT)
 
     def _save_pool_settings(self):
@@ -291,6 +291,9 @@ class Store:
             live = [a for a in self.accounts if a.get("enabled", True) and a.get("cookies")]
             if not live:
                 return None
+            # An account whose session failed is only used when no healthy one exists at all: when the healthy ones
+            # are merely busy, the caller waits for them instead of being handed a broken account.
+            live = [a for a in live if a.get("ok") is not False] or live
             blocked = set(exclude_ids or [])
             if exclude_id:
                 blocked.add(exclude_id)
@@ -352,6 +355,9 @@ class Store:
                     a["ok"] = ok
                     a["note"] = note[:300]
                     a["checked_at"] = int(time.time())
+                    # Muse locked the account: turn it off so rotation and keepalive leave it alone.
+                    if not ok and "Muse is disconnected" in note:
+                        a["enabled"] = False
             self._save_accounts()
 
     def get_account(self, aid: str) -> dict | None:

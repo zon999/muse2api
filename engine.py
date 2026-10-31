@@ -39,6 +39,10 @@ class MuseAuthError(RuntimeError):
     pass
 
 
+class MuseAccountDisconnected(MuseAuthError):
+    """muse.ai shows "Muse is disconnected": the account was locked on Muse's side. store.mark() turns it off."""
+
+
 class MuseGenerationError(RuntimeError):
     pass
 
@@ -155,13 +159,14 @@ class MuseEngine:
             env = dict(os.environ)
             env.setdefault("HOME", self.cfg.home_dir)
             env["PATH"] = (self.cfg.extra_path + os.pathsep + env.get("PATH", "")) if self.cfg.extra_path else env.get("PATH", "")
+            show = os.environ.get("MUSE2API_SHOW_BROWSER") == "1"  # visible window, for watching a job
             args = [
                 self.cfg.chromium,
-                "--headless=new", "--no-sandbox", "--disable-gpu",
+                *([] if show else ["--headless=new"]), "--no-sandbox", "--disable-gpu",
                 "--disable-dev-shm-usage", "--disable-background-networking",
                 "--no-first-run", "--no-default-browser-check",
                 "--autoplay-policy=no-user-gesture-required",
-                "--window-size=1440,2400",
+                "--window-size=1280,900" if show else "--window-size=1440,2400",
                 f"--remote-debugging-port={self.cfg.cdp_port}",
                 "--remote-allow-origins=*",
                 f"--user-data-dir={self.cfg.profile_dir}",
@@ -237,6 +242,30 @@ class MuseEngine:
         """关闭当前线程专属的页面并销毁隔离的 BrowserContext，彻底释放内存与 Session。"""
         p = self.page
         ctx_id = self.current_context_id
+        if os.environ.get("MUSE2API_SHOW_BROWSER") == "1" and (p or ctx_id):
+            # Visible-window mode: leave the page up for a while so a failed job can be looked at.
+            browser = self.browser
+
+            def _late_close(page=p, cid=ctx_id):
+                try:
+                    if page:
+                        page.close()
+                except Exception:  # noqa: BLE001
+                    pass
+                try:
+                    if cid and browser:
+                        browser.send("Target.disposeBrowserContext", {"browserContextId": cid})
+                except Exception:  # noqa: BLE001
+                    pass
+                with self._contexts_lock:
+                    self._active_contexts.discard(cid)
+
+            threading.Timer(120.0, _late_close).start()
+            self.page = None
+            self.current_context_id = None
+            self.current_acc_id = None
+            self.current_proxy = None
+            return
         if p:
             try:
                 p.close()
@@ -285,6 +314,8 @@ class MuseEngine:
             except Exception as exc:
                 if proxy_url:
                     # a plain tab would go out on this machine's own IP, so never fall back for a proxied account
+                    # (the exception text may carry the proxy URL, so only its type is logged)
+                    log.warning("创建走代理的浏览器上下文失败: %s", type(exc).__name__)
                     raise MuseProxyError("无法为该账号创建走代理的浏览器上下文") from None
                 log.warning("Target.createBrowserContext 创建隔离上下文失败，回退到普通标签页: %s", exc)
         if proxy_url:
@@ -396,6 +427,14 @@ class MuseEngine:
                 exp_val = float(exp) if exp and float(exp) > now + 3600 else (now + 7 * 86400)
             except (TypeError, ValueError):
                 exp_val = now + 7 * 86400
+            if name.startswith("__Host-"):
+                # Chromium rejects a __Host- cookie that carries a Domain, so it is set by url instead.
+                try:
+                    page.send("Network.setCookie", {"name": name, "value": value, "url": "https://muse.ai/",
+                                                    "path": "/", "secure": True, "expires": exp_val})
+                except Exception:  # noqa: BLE001
+                    pass
+                continue
             for dom in (".muse.ai", "muse.ai"):
                 params = {
                     "name": name,
@@ -553,6 +592,7 @@ class MuseEngine:
                 except Exception:
                     body = ""
                 self._close_page()
+                self._raise_if_disconnected(body)
             if "connecting..." in body:
                 raise MuseGenerationError("页面网关连接超时 (Connecting...)，正在自动切换账号")
             # Distinguish an expired session from a page that never became ready.
@@ -663,6 +703,15 @@ class MuseEngine:
         self.ensure_page(cookies, expires, account_id=account_id)
         self._dismiss_quota_ui()
         try:
+            return self._read_quota_panel()
+        finally:
+            try:
+                self._dismiss_quota_ui()
+            except Exception:
+                log.warning('关闭额度设置面板失败')
+
+    def _read_quota_panel(self) -> dict:
+        try:
             self._quota_click(self._QUOTA_SETTINGS_JS, '找不到设置入口（Settings／設定／设置）')
             self._quota_click(self._QUOTA_MENU_JS, '设置菜单未出现可识别的设置项')
             deadline = time.monotonic() + 12.0
@@ -673,11 +722,10 @@ class MuseEngine:
                 if time.monotonic() >= deadline:
                     raise MuseGenerationError('额度面板未读到有效用量；旧缓存未覆盖')
                 time.sleep(0.2)
-        finally:
-            try:
-                self._dismiss_quota_ui()
-            except Exception:
-                log.warning('关闭额度设置面板失败')
+        except MuseGenerationError:
+            # a locked account shows Muse's "disconnected" screen instead of the settings menu
+            self._raise_if_disconnected()
+            raise
 
     @staticmethod
     def _parse_quota(txt: str) -> dict:
@@ -1421,8 +1469,14 @@ class MuseEngine:
                 raw_res = self.page.js(self._INJECT_JS % (json.dumps(b64), json.dumps(mime), json.dumps(name)))
                 res_obj = json.loads(raw_res) if isinstance(raw_res, str) else raw_res
                 if not res_obj.get("ok"):
+                    log.warning("参考图附加失败: 页面返回 %s（图 %d/%d，%d KB，%s）", res_obj, i + 1, len(files), len(b64) * 3 // 4 // 1024, mime)
+                    self._dump_page_state("attach-failed")
+                    self._raise_if_disconnected()
                     raise MuseGenerationError("附加参考图失败，已停止生成")
+            except (MuseGenerationError, MuseAuthError):
+                raise
             except Exception as e:
+                log.warning("参考图附加失败: %s: %s（图 %d/%d，%d KB，%s）", type(e).__name__, str(e)[:200], i + 1, len(files), len(b64) * 3 // 4 // 1024, mime)
                 raise MuseGenerationError("附加参考图失败，已停止生成") from e
 
             deadline = time.time() + 15.0
@@ -1546,6 +1600,32 @@ class MuseEngine:
             if e in (url or "").lower():
                 return e
         return ".mp4" if expect == "video" else ".png"
+
+    DISCONNECTED_RE = re.compile(r"muse is disconnected|we disconnected muse", re.I)
+
+    def _raise_if_disconnected(self, text: str | None = None):
+        """Raises MuseAccountDisconnected when the page (or the given text) is Muse's "disconnected" screen."""
+        if text is None:
+            try:
+                text = self.page.js("document.body ? document.body.innerText.slice(0,1200) : ''") or ""
+            except Exception:  # noqa: BLE001
+                return
+        if self.DISCONNECTED_RE.search(text):
+            raise MuseAccountDisconnected("Muse is disconnected: 账号已被 Muse 断开连接（保护账号信息），需要提交反馈工单才能恢复")
+
+    def _dump_page_state(self, tag: str):
+        """Writes where the page is (url, title, inputs, visible buttons, text tail) so a failed attach can be diagnosed."""
+        try:
+            info = self.page.js(
+                "JSON.stringify({url:location.href,title:document.title,"
+                "inputs:[...document.querySelectorAll('input')].map(function(x){return {type:x.type,accept:x.accept,name:x.name};}),"
+                "buttons:[...document.querySelectorAll('button,[role=button]')].filter(b=>b.offsetParent!==null)"
+                ".map(b=>b.getAttribute('aria-label')||b.innerText.trim().slice(0,30)).filter(Boolean).slice(0,40),"
+                "tail:document.body.innerText.slice(0,700)})")
+            with open(os.path.join(self.cfg.data_dir, f"debug-{tag}.json"), "w", encoding="utf-8") as f:
+                f.write(str(info))
+        except Exception:  # noqa: BLE001
+            pass
 
     def _debug_dump(self, tag: str):
         try:
