@@ -17,7 +17,7 @@ from store import Store
 
 
 def test_concurrency_lock():
-    lock = app.ConcurrencyLock(limit=2)
+    lock = app.ConcurrencyLock(lambda: 2)
     assert not lock.locked()
 
     # 第一个槽位
@@ -50,7 +50,7 @@ def test_account_pool_manager():
         {"id": "acc-2", "label": "A2", "enabled": True, "cookies": {"k": "v2"}},
     ]
     dummy_store = SimpleNamespace(
-        accounts=dummy_accounts,
+        accounts=dummy_accounts, per_account=1, max_accounts=10,
         get_account=lambda aid: next((a for a in dummy_accounts if a["id"] == aid), None),
         pick_account=lambda preferred_id=None, rotate=True, force_rotate=False, exclude_ids=None, record_use=True: next(
             (a for a in dummy_accounts if a["id"] not in (exclude_ids or set())), None
@@ -98,13 +98,13 @@ def test_account_pool_per_account_limit():
         {"id": "acc-2", "label": "A2", "enabled": True, "cookies": {"k": "v2"}},
     ]
     dummy_store = SimpleNamespace(
-        accounts=dummy_accounts,
+        accounts=dummy_accounts, per_account=2, max_accounts=10,
         get_account=lambda aid: next((a for a in dummy_accounts if a["id"] == aid), None),
         pick_account=lambda preferred_id=None, rotate=True, force_rotate=False, exclude_ids=None, record_use=True: next(
             (a for a in dummy_accounts if a["id"] not in (exclude_ids or set())), None
         )
     )
-    pool = app.AccountPoolManager(dummy_store, per_account=2)
+    pool = app.AccountPoolManager(dummy_store)
 
     # 空闲账号优先：前两个任务分到两个不同账号
     ids = [pool.acquire(timeout=0.5)["id"] for _ in range(2)]

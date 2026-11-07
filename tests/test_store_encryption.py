@@ -17,7 +17,8 @@ COOKIES = {"hatch_sess": "secret-sess", "hatch_native_auth_device": "secret-dev"
 def make_cfg(tmp, key=""):
     data = Path(tmp)
     return SimpleNamespace(accounts_file=str(data / "accounts.json"),
-                           tasks_file=str(data / "tasks.json"), data_key=key)
+                           tasks_file=str(data / "tasks.json"), data_key=key,
+                           rotation_file=str(data / "rotation.json"))
 
 
 def test_plaintext_without_key_is_unchanged():

@@ -109,5 +109,6 @@ def test_readyz_reports_version():
         status, _, body = asyncio.run(call(module.app, "GET", "/readyz"))
         data = json.loads(body)
         assert status == 200 and data["version"] == module.app.version
-        assert data["concurrency"] == module.CFG.max_concurrency
+        # total slots = working accounts x jobs per account (at least 1 with no accounts)
+        assert data["concurrency"] == module.store.concurrency_limit()
         assert data["account_concurrency"] == module.CFG.account_concurrency
