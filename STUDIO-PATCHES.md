@@ -1,7 +1,33 @@
 # Studio patches
 
-Changes on the `studio` branch on top of upstream muse2api v1.6.3 (`e2b8936`), made so the engine can
-run as a local backend for Muse Studio. `main` tracks upstream; `studio` is rebased onto it.
+Changes on the `studio` branch on top of upstream muse2api, made so the engine can run as a local backend for
+Muse Studio. `main` tracks upstream. `studio` started on v1.6.3 (`e2b8936`) and has upstream v1.6.9 (`8a3dab9`)
+merged in (a merge, not a rebase: the two sides changed the same proxy, reference and account-pool code).
+
+## Upstream v1.6.9 merge (2026-11-08)
+
+Taken from upstream: composer detection on the new muse.ai page (no placeholder overlay, no `<form>`), references
+uploaded with `DOM.setFileInputFiles` (images, video, audio, PDF/DOC; 10 files, 40 MiB each, 100 MiB total), a
+generated result that is byte-identical to an uploaded reference is never delivered, per-context download folders,
+model-refusal detection, fresh disposable context per quota read, login sessions accepted with only `hatch_sess`,
+reference-source safety switches (`MUSE2API_REF_IMAGE_LOCAL_FILES`, `MUSE2API_REF_IMAGE_PRIVATE_FETCH`) and the
+full-width admin page.
+
+Kept from studio instead of upstream:
+
+- **Proxies.** Upstream's per-account proxy (`proxy.py`, a `proxy` object on the account, `/admin/accounts/{id}/proxy/test`,
+  test receipts) is dropped. Studio's `proxy_url`, `/admin/proxy/test`, `/admin/proxy/tunnel` and `proxy_support.py`
+  stay, because Muse Studio calls them. The admin page's proxy button is removed since its dialog needs the dropped
+  routes. Upstream's proxy tests went with it.
+- **Account leases.** Upstream's `_account_operation` locks an account against tasks. Here it only hands out a copy
+  and closes the page: Studio runs several jobs per account and polls keepalive while they run.
+- **Reference field.** `reference_images` is still accepted and joins `images` (Studio sends it). The old 6-file / 8 MB
+  limits and base64 injection are replaced by upstream's limits and upload path.
+- Cancel, resume (`on_session`), session-stop detection and the load gate are carried into upstream's new
+  `generate` / `_generate_attached` / `_wait_attachment`.
+
+`tests/run_all.sh` also runs `test_reference_upload_browser.py` (real Chrome, no Muse login). `test_admin_layout.py`
+is not run on macOS: Chrome there keeps a 15px scrollbar and the English page at 320px overflows (upstream too).
 
 Run the offline suite with `tests/run_all.sh` (needs `uv` and `node`; uses local Chrome for the
 browser-based media test). No test touches a real Muse account.
@@ -18,7 +44,7 @@ browser-based media test). No test touches a real Muse account.
 | Cancel | `POST /v1/tasks/{id}/cancel`; queued tasks never reach Muse, running ones click Muse's stop button | `e2f0c99`, `140e8bf` | Verified: video cancelled in 3s, Muse session `interrupted` |
 | Task lookup | `GET /v1/tasks/{id}` for image and video tasks | `fe0e69a` | Offline only |
 | Encryption | `accounts.json` encrypted with Fernet when `MUSE2API_DATA_KEY` is set | `18321c0` | Offline only |
-| Reference images | `reference_images` (≤ 6, ≤ 8MB total) for image and video tasks, uploaded one by one | `ca24d3f` | Verified: 3 references accepted, all used in the output |
+| Reference images | `reference_images` for image and video tasks; since the v1.6.9 merge it joins upstream's `images` and uses upstream's limits and upload | `ca24d3f` | Verified before the merge: 3 references accepted, all used in the output |
 | Resume | Muse thread id + account stored on the task; on startup the thread is reopened to fetch the result | `8f4ce03` | Verified: engine stopped mid-video, restarted, same thread's video fetched |
 | Readiness | `/readyz` reports `version` | `74b0526` | Offline only |
 | Browser lifecycle | One Chromium even when jobs start concurrently; a reattached browser is closed on stop | `cb7fa8d` | Verified: no Chrome left after shutdown |
@@ -45,8 +71,8 @@ Quota stays on upstream's UI scraping: the server action HaoHao used no longer e
 - `GET /v1/tasks/{id}` → the same body as `GET /v1/images/tasks/{id}` or `GET /v1/videos/{id}`.
   Running tasks carry `account` and `muse_session` once Muse has created the thread.
 - `POST /v1/images/tasks`, `POST /v1/images/generations`, `POST /v1/videos` accept
-  `reference_images: [dataURL | url | {url} | {b64_json} | {image_url}]`, merged with the older
-  single-image fields; more than 6 images or more than 8MB inline → 400.
+  `reference_images: [dataURL | url | {url} | {b64_json} | {image_url}]`, appended after upstream's `images`;
+  limits are upstream's (10 files, 40 MiB each, 100 MiB total) → 400 beyond them.
 - `PATCH /admin/accounts/{id}` accepts `proxy_url` (`http://`, `https://` or `socks5://`, no password for socks5;
   `""` clears it). Account responses never contain the URL, only `has_proxy` and `proxy_host`.
 - `POST /admin/proxy/test` `{proxy_url, quick?}` → `{ok, ip, latency_ms, muse_reachable, muse_status, error}`.

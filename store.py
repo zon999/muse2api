@@ -12,10 +12,9 @@ from proxy_support import proxy_host
 
 _LOCK = threading.Lock()
 
-# 决定账号生死的核心 cookie（与 engine.ESSENTIAL_COOKIES 保持一致）
-# 注：hatch_gw 为网关路由缓存（约1年），服务端续签与 VM 唤醒主要依赖 hatch_sess 和 hatch_vml，缺 gw 亦可正常分配路由
-ESSENTIAL_COOKIES = ("hatch_sess", "hatch_vml",
-                     "hatch_native_auth_device")
+# 登录会话存在性检查；可用性仍须经上游认证（与 engine 一致）
+# hatch_vml 是可选工作区令牌，缺失不能据此拒绝会话导入
+ESSENTIAL_COOKIES = ("hatch_sess",)
 
 
 def _is_pos(v) -> bool:
@@ -257,8 +256,8 @@ class Store:
         item = {k: v for k, v in a.items() if k not in ("cookies", "proxy_url")}
         item["has_proxy"] = bool(a.get("proxy_url"))
         item["proxy_host"] = proxy_host(a.get("proxy_url"))
+        item["cookie_count"] = len(a.get("cookies", {}))
         return item
-
     def list_accounts(self) -> list[dict]:
         out = []
         for a in self.accounts:
@@ -379,7 +378,7 @@ class Store:
             for a in self.accounts:
                 if a["id"] == aid:
                     for k, v in kw.items():
-                        if v is not None:
+                        if v is not None or k == "ok":
                             a[k] = v
                     if "cookies_exp" in kw and kw["cookies_exp"] is not None:
                         ce = a["cookies_exp"]
