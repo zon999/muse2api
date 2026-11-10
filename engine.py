@@ -1355,7 +1355,11 @@ class MuseEngine:
                         || document.querySelector('button[aria-label*="Stop" i]')
                         || document.querySelector('button[aria-label*="停止"]'));
                     var tail = document.body ? (document.body.innerText||'').slice(-1200) : '';
-                    return JSON.stringify({cnt: bs.length, txt: lastTxt, stop: hasStop, tail: tail,
+                    // An attachment grid whose tiles are still skeletons is media on its way, not a text-only reply.
+                    var pending = [].slice.call(document.querySelectorAll('[data-testid^="hatch-chat-attachment-presentation-"]'))
+                        .some(function(a){return !a.closest('form, [class*=chat-user-bubble]')
+                            && !!a.querySelector('[data-slot="skeleton"]');});
+                    return JSON.stringify({cnt: bs.length, txt: lastTxt, stop: hasStop, tail: tail, pending: pending,
                         path: location.pathname || '', href: location.href || ''});
                 })()""")
                 st = json.loads(st_raw) if st_raw else {}
@@ -1365,9 +1369,10 @@ class MuseEngine:
             cur_cnt = int(st.get("cnt") or 0)
             cur_txt = st.get("txt") or ""
             has_stop = bool(st.get("stop"))
+            media_pending = bool(st.get("pending"))
             path = st.get("path") or ""
             seen_stop = seen_stop or has_stop
-            state = (cur_cnt, cur_txt, len(atts), has_stop, path)
+            state = (cur_cnt, cur_txt, len(atts), has_stop, path, media_pending)
             if previous_state is None or state != previous_state:
                 last_activity = time.time()
                 previous_state = state
@@ -1394,7 +1399,7 @@ class MuseEngine:
             refusal_source = cur_txt if cur_cnt > base_agent_cnt else (
                 tail if seen_stop and not has_stop and elapsed > 20.0 else "")
             refusal = self._media_refusal_text(refusal_source, expect)
-            if refusal and not has_stop and len(atts) <= base_att_cnt:
+            if refusal and not has_stop and not media_pending and len(atts) <= base_att_cnt:
                 if refusal == refusal_last:
                     refusal_stable += 1
                 else:
@@ -1404,7 +1409,8 @@ class MuseEngine:
             else:
                 refusal_last, refusal_stable = "", 0
 
-            if cur_cnt > base_agent_cnt and cur_txt and not has_stop and len(atts) <= base_att_cnt:
+            if (cur_cnt > base_agent_cnt and cur_txt and not has_stop and not media_pending
+                    and len(atts) <= base_att_cnt):
                 # Media-status text can precede a real attachment; do not fail on it.
                 is_media_report = self._media_status_pending(cur_txt)
                 if not is_media_report:
