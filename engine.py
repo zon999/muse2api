@@ -1191,6 +1191,35 @@ class MuseEngine:
         time.sleep(0.3)
         return clicked
 
+    def _composer_unsent(self) -> str:
+        """What is still in the composer (unsent attachments or text); "" when it is empty or unreadable."""
+        try:
+            n = int(self.page.js(self._ATTACHED_COUNT_JS) or 0)
+            t = int(self.page.js("(document.querySelector('textarea')||{value:''}).value.length") or 0)
+        except Exception:  # noqa: BLE001
+            return ""
+        parts = []
+        if n:
+            parts.append("%d 个附件" % n)
+        if t:
+            parts.append("%d 字提示词" % t)
+        return "、".join(parts)
+
+    def _click_send(self) -> str:
+        """Clicks the send button only (the prompt is not typed again): clicked / disabled / no-button / error."""
+        try:
+            return str(self.page.js(
+                "(function(){var b=[...document.querySelectorAll('button,[role=button]')]"
+                ".filter(function(x){return x.offsetParent!==null;})"
+                ".find(function(x){return /发送|send/i.test(x.getAttribute('aria-label')||'')"
+                "||/发送|send/i.test(x.getAttribute('data-testid')||'')"
+                "||/send/i.test(x.innerText||'');});"
+                "if(!b)return 'no-button';"
+                "if(b.disabled)return 'disabled';"
+                "b.click();return 'clicked';})()"))
+        except Exception:  # noqa: BLE001
+            return "error"
+
     # ---------------- 等待生成 ----------------
     def _last_attachment(self) -> dict | None:
         atts = self.attachments()
@@ -1274,6 +1303,7 @@ class MuseEngine:
         previous_state = None
         last_activity = t_start
         progress_sent = 0
+        resent = False
         next_session_check = t_start + 10.0
         while time.time() < deadline:
             if stop_event is not None and stop_event.is_set():
@@ -1387,6 +1417,17 @@ class MuseEngine:
                         progress_sent = milestone
                     except Exception:
                         pass
+
+            # From upstream 8213b3d: 25s after sending with no reply and the attachments or text still in the
+            # composer, the message never left. Click send once more; still there after 60s means give up.
+            if elapsed > 25.0 and cur_cnt == base_agent_cnt:
+                unsent = self._composer_unsent()
+                if unsent and not resent:
+                    resent = True
+                    log.warning("提示词发出 %.0f 秒后仍在输入框（%s），补点一次发送", elapsed, unsent)
+                    self._click_send()
+                elif unsent and elapsed > 60.0:
+                    raise MuseGenerationError("提示词没有发出去（%s 仍在输入框里），终止等待并换号重试" % unsent)
 
             if re.search(r"额度不足|积分不足|out of credits|达到上限|token limit", tail, re.I):
                 raise MuseGenerationError("账号额度不足")
