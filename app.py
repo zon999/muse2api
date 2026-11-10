@@ -914,8 +914,15 @@ def parse_tool_calls(text: str) -> tuple[list[dict] | None, str]:
     return None, text
 
 
+# A prompt that starts with this marker is sent to Muse word for word (marker removed): no first-frame,
+# aspect or duration instructions are added, so Muse's agent decides the video itself.
+RAW_PROMPT_PREFIX = "[raw]"
+
+
 def build_video_prompt(r: VideoRequest, kinds: list[str] | None = None) -> str:
     user_prompt = r.prompt.strip()
+    if user_prompt.startswith(RAW_PROMPT_PREFIX):
+        return user_prompt[len(RAW_PROMPT_PREFIX):].strip()
     ar = (r.aspect_ratio or "").strip().lower()
     sz = (r.size or "").strip().lower()
     dur = r.duration or 6

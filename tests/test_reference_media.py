@@ -101,6 +101,8 @@ with tempfile.TemporaryDirectory() as home:
     assert "[视频2] 是第 2 个附件（视频）" in two_videos
     assert "图生视频" not in app.build_video_prompt(app.VideoRequest(prompt="x", videos=["v"], size="16:9"), ["video"])
     assert "图生视频" in app.build_video_prompt(app.VideoRequest(prompt="x", image="i", size="16:9"))
+    raw = app.build_video_prompt(app.VideoRequest(prompt="[raw] Make a video from this photo.", image="i", size="9:16"))
+    assert raw == "Make a video from this photo."
     video_only = app.build_video_prompt(app.VideoRequest(prompt="x", videos=["v"]), ["video"])
     assert "1 段视频" in video_only and "第一张图片" not in video_only
     image_prompt = app.build_image_prompt(app.ImageRequest(prompt="x", videos=["v"]), ["video"])
