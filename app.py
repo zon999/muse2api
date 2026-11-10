@@ -2865,17 +2865,30 @@ def _upgrade_from_github_sync() -> dict:
     }
 
 
+# Muse Studio runs this engine from its own reviewed `studio` branch. Pulling the upstream repo here would overwrite
+# the Studio patches with unreviewed code (upstream later added silent self-upgrades), and pushing would publish
+# local code, so the update routes are off. Updates come in as reviewed merges on the studio branch.
+UPDATES_DISABLED_MESSAGE = "Updates are managed by Muse Studio; online update from GitHub is disabled in this build"
+
+
 @app.get("/admin/update/check")
 @app.get("/admin/repo/status")
 async def admin_check_update(force: bool = False):
-    """供所有已部署节点实时检测 GitHub 官方仓库是否有新版本更新。"""
-    return await asyncio.to_thread(_check_update_sync, force)
+    """Reports the local version only; no GitHub request is made."""
+    version = str(_read_local_version().get("version") or "")
+    return {"disabled": True, "message": UPDATES_DISABLED_MESSAGE, "repo_url": REPO_URL,
+            "local_version": version, "remote_version": version, "has_update": False, "up_to_date": True,
+            "recent_commits": []}
 
 
 @app.post("/admin/update/upgrade")
 @app.post("/admin/repo/pull")
 async def admin_upgrade_now(payload: dict = Body(default={}), _=Depends(auth)):
-    """一键从 GitHub 官方仓库拉取最新更新并自动平滑重启服务。"""
+    raise HTTPException(403, UPDATES_DISABLED_MESSAGE)
+
+
+async def _admin_upgrade_from_github(payload: dict):
+    """Upstream's one-click upgrade, kept unrouted so upstream merges stay small."""
     res = await asyncio.to_thread(_upgrade_from_github_sync)
     restart = payload.get("restart", True) if isinstance(payload, dict) else True
     if restart:
@@ -2892,7 +2905,11 @@ async def admin_upgrade_now(payload: dict = Body(default={}), _=Depends(auth)):
 
 @app.post("/admin/repo/push")
 async def admin_repo_push(payload: dict = Body(default={}), _=Depends(auth)):
-    """维护者专用：将当前节点核心代码推送到 GitHub 仓库（自动过滤 .env 与 data 目录）。"""
+    raise HTTPException(403, UPDATES_DISABLED_MESSAGE)
+
+
+async def _admin_repo_push_to_github(payload: dict):
+    """Upstream's maintainer push, kept unrouted so upstream merges stay small."""
     msg = (payload.get("message") or "").strip() or f"chore: sync update ({time.strftime('%Y-%m-%d %H:%M:%S')})"
     new_token = (payload.get("github_token") or "").strip()
     if new_token:

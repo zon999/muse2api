@@ -2239,6 +2239,11 @@ function dismissUpdateBanner(){
 async function loadRepoStatus(force){
   try{
     let s = await api('/admin/update/check' + (force ? '?force=true' : ''));
+    if (s.disabled){
+      // Muse Studio build: updates come from Studio, so hide the update UI and never ask GitHub.
+      ['btnRepoTop', 'repoPanel', 'updateBanner'].forEach(id => { const el = $(id); if (el) el.style.display = 'none'; });
+      return;
+    }
     // 若服务端网络无法直连 GitHub API，则由用户浏览器端直接请求 GitHub API 兜底检测
     if (!s.remote_sha){
       try{
