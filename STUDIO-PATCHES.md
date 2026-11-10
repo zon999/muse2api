@@ -4,6 +4,14 @@ Changes on the `studio` branch on top of upstream muse2api, made so the engine c
 Muse Studio. `main` tracks upstream. `studio` started on v1.6.3 (`e2b8936`) and has upstream v1.6.9 (`8a3dab9`)
 merged in (a merge, not a rebase: the two sides changed the same proxy, reference and account-pool code).
 
+## Upstream after v1.6.9 (checked 2026-11-10, not merged)
+
+`c864bd5` only adds an advert to the README. `1795dab` changes account rotation (strict LRU, default concurrency 8),
+which conflicts with Studio's account scheduling. `8213b3d`, titled "perf: optimize session keepalive and UI rendering",
+also makes the keepalive loop pull upstream code and restart every 15 minutes, report "up to date" whatever the
+state, and rename upstream commit messages containing "linux" to that same title. Only its composer resend fix is
+taken (see Patches); the update routes are turned off.
+
 ## Upstream v1.6.9 merge (2026-11-08)
 
 Taken from upstream: composer detection on the new muse.ai page (no placeholder overlay, no `<form>`), references
@@ -52,8 +60,11 @@ browser-based media test). No test touches a real Muse account.
 | Account proxy | Optional `proxy_url` per account: `requests` calls and the account's BrowserContext (`proxyServer`) use it; a proxied account never falls back to a plain tab; proxies with a password go through a loopback forwarder (`proxy_support.py`) | (this commit) | Chrome verified offline against a fake authenticating proxy; not run against a real proxy |
 | Video idempotency | `POST /v1/videos` honours `Idempotency-Key` like image tasks (same key → same task; different body → 409) | (this commit) | Offline only |
 | Chat streaming | `chat_stream` emits only text past what it already sent and holds back a trailing markdown marker Muse is still rendering ("-" plus a zero-width space), so a re-rendered bubble no longer repeats the whole reply; a new agent bubble flushes the previous one first. While the Stop button shows (the agent is running tools), the 40s first-token limit gives way to the request timeout. Not fixed upstream as of `8213b3d` | `4cf7527` | Verified 2026-11-10: list replies on both accounts come back once |
-| Account pin | `/v1/chat/completions` and `/v1/videos` accept `account_id`: the request runs on that account only and never fails over, because each account has its own Muse workspace (`/home/hatch`). With a `[raw]` video prompt (`f10272f`) this also fetches an existing workspace file ("attach ~/…/final.mp4") through the normal media download | (this commit) | Verified 2026-11-10: status check answered from the pinned account; two workspace videos fetched byte-identical |
-| Chat detach | `/v1/chat/completions` accepts `detach: true`: the call returns once Muse has accepted the message (the page's thread is listed by the gateway with a live status, or the first text arrived), frees the chat lock and answers with `muse_session` (the thread id), so long agent jobs run in parallel in Muse. Returning on the Stop button alone lost the message: the button also shows before the gateway acknowledges it. The chat lock is still one for the whole engine (one browser) | (this commit) | Verified 2026-11-10: two detached shell jobs sent 16s apart on one account both ran to the end in parallel, and a status chat during them did not disturb them |
+| Account pin | `/v1/chat/completions` and `/v1/videos` accept `account_id`: the request runs on that account only and never fails over, because each account has its own Muse workspace (`/home/hatch`). With a `[raw]` video prompt (`f10272f`) this also fetches an existing workspace file ("attach ~/…/final.mp4") through the normal media download | `2d772f6` | Verified 2026-11-10: status check answered from the pinned account; two workspace videos fetched byte-identical |
+| Chat detach | `/v1/chat/completions` accepts `detach: true`: the call returns once Muse has accepted the message (the page's thread is listed by the gateway with a live status, or the first text arrived), frees the chat lock and answers with `muse_session` (the thread id), so long agent jobs run in parallel in Muse. Returning on the Stop button alone lost the message: the button also shows before the gateway acknowledges it. The chat lock is still one for the whole engine (one browser) | `2d772f6` | Verified 2026-11-10: two detached shell jobs sent 16s apart on one account both ran to the end in parallel, and a status chat during them did not disturb them |
+| Composer resend | From upstream `8213b3d` (only this part): 25s after sending with no reply and attachments or text still in the composer, click send once more; still there after 60s fails the task | `f596090` | Offline only |
+| Updates off | `/admin/update/check` and `/admin/repo/status` report the local version without asking GitHub; `/admin/update/upgrade`, `/admin/repo/pull` and `/admin/repo/push` answer 403; the admin page hides the update button, banner and panel. Pulling upstream here would overwrite the Studio patches, and upstream `8213b3d` adds silent self-upgrades | `0997f3b` | Offline only |
+| Cancel detached chat | `POST /v1/chat/sessions/{session_id}/stop` `{account_id}` opens the thread on that account and clicks Stop, then waits up to 15s for `interrupted` | (this commit) | Offline only |
 
 Quota stays on upstream's UI scraping: the server action HaoHao used no longer exists on Muse.
 
@@ -84,6 +95,10 @@ Quota stays on upstream's UI scraping: the server action HaoHao used no longer e
 - `POST /admin/proxy/tunnel` `{proxy_url}` → `{server}`: the address Chromium should use for that proxy.
 - Proxy failures raise `MuseProxyError`, whose text starts with `PROXY_ERROR:` and never contains the URL.
 - `/readyz` adds `version`.
+- `POST /v1/chat/completions` accepts `account_id` and `detach`; a detached reply carries `muse_session`.
+- `POST /v1/videos` accepts `account_id`; a prompt starting with `[raw]` is sent word for word.
+- `POST /v1/chat/sessions/{session_id}/stop` `{account_id}` → `{status}`; 404 unknown thread, 409 already ended.
+- `/admin/update/upgrade`, `/admin/repo/pull`, `/admin/repo/push` → 403; `/admin/update/check` → `{disabled: true, …}`.
 - New task status `cancelled`.
 
 ## Live check (2026-10-23)

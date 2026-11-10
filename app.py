@@ -53,7 +53,8 @@ from proxy_support import parse_proxy_url, probe_proxy, requests_proxies
 from engine import (ESSENTIAL_COOKIES, MAX_REFERENCE_IMAGE_BYTES,
                     MAX_REFERENCE_IMAGES, MAX_REFERENCE_TOTAL_BYTES,
                     REFERENCE_MIME_EXT, MuseAuthError, MuseEngine, MuseGenerationError,
-                    MuseModelRefusalError, MuseSessionStopped, RefImageSafetyError, reference_kind)
+                    MuseModelRefusalError, MuseSessionNotFound, MuseSessionStopped, RefImageSafetyError,
+                    reference_kind)
 from engine import MuseProxyError
 from store import Store, account_expiry, min_expiry
 
@@ -1642,6 +1643,35 @@ _SSE_HEADERS = {
     "X-Accel-Buffering": "no",
     "Connection": "keep-alive",
 }
+
+
+class StopSessionRequest(BaseModel):
+    account_id: str
+
+
+@app.post("/v1/chat/sessions/{session_id}/stop")
+async def stop_chat_session(session_id: str, req: StopSessionRequest, _=Depends(auth)):
+    """Muse Studio extension: stops a detached agent chat (its muse_session) on the account that runs it."""
+    acc = store.get_account(req.account_id)
+    if not acc or not acc.get("cookies"):
+        raise HTTPException(400, f"账号不可用: {req.account_id}")
+
+    def run():
+        with GEN_LOCK:
+            engine.start()
+            return engine.stop_session(acc["cookies"], session_id, acc.get("cookies_exp"), account_id=acc["id"])
+
+    try:
+        status, stopped = await asyncio.to_thread(run)
+    except MuseSessionNotFound:
+        raise HTTPException(404, f"Muse 会话不存在: {session_id}")
+    except MuseAuthError as exc:
+        raise HTTPException(401, str(exc))
+    except MuseGenerationError as exc:
+        raise HTTPException(502, str(exc))
+    if not stopped:
+        raise HTTPException(409, f"会话已结束: {status}")
+    return {"status": status}
 
 
 @app.post("/v1/chat/completions")

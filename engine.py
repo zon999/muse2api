@@ -257,6 +257,10 @@ class LoadGate:
             self._cond.notify()
 
 
+class MuseSessionNotFound(MuseGenerationError):
+    """The gateway does not list this thread for the account (wrong account, or never created)."""
+
+
 class MuseModelRefusalError(MuseGenerationError):
     """Muse completed the turn with text instead of the requested media."""
 
@@ -2079,11 +2083,8 @@ class MuseEngine:
             time.sleep(0.1)
         raise MuseGenerationError("页面只返回了本次上传的参考素材，未出现新的生成结果")
 
-    def resume(self, cookies: dict, session_id: str, expect: str = "image",
-               timeout: int = 240, expires: dict | None = None, account_id: str | None = None,
-               on_progress=None, stop_event=None) -> dict:
-        """服务重启后重新打开原 Muse 线程取结果：已完成直接取回，仍在生成则继续等待，
-        已中断/失败则由会话状态检查立即结束。"""
+    def _open_thread(self, cookies: dict, session_id: str, expires: dict | None, account_id: str | None):
+        """Opens an existing Muse thread on the account's page and waits for its gateway connection."""
         if not self._THREAD_ID_RE.fullmatch(session_id or ""):
             raise MuseGenerationError("无效的 Muse 会话 id")
         self.ensure_page(cookies, expires, account_id=account_id)
@@ -2096,6 +2097,35 @@ class MuseEngine:
         else:
             raise MuseGenerationError("无法打开原 Muse 会话")
         self._wait_ws_ready(self.page, timeout=12.0)
+
+    def stop_session(self, cookies: dict, session_id: str, expires: dict | None = None,
+                     account_id: str | None = None, wait: float = 15.0) -> tuple[str, bool]:
+        """Stops a detached agent thread: opens it and clicks Stop.
+
+        Returns (status, stopped): stopped is False when the thread had already ended (nothing to stop).
+        Raises MuseSessionNotFound when the gateway does not list the thread for this account."""
+        self._open_thread(cookies, session_id, expires, account_id)
+        status = self._muse_session_status()
+        if not status:
+            raise MuseSessionNotFound(session_id)
+        if status in self.STOPPED_SESSION_STATUSES:
+            return status, False
+        if self.stop_generation() != "clicked":
+            return status, False
+        t_end = time.time() + wait
+        while time.time() < t_end:
+            time.sleep(1.0)
+            status = self._muse_session_status() or status
+            if status in self.STOPPED_SESSION_STATUSES:
+                break
+        return status, True
+
+    def resume(self, cookies: dict, session_id: str, expect: str = "image",
+               timeout: int = 240, expires: dict | None = None, account_id: str | None = None,
+               on_progress=None, stop_event=None) -> dict:
+        """服务重启后重新打开原 Muse 线程取结果：已完成直接取回，仍在生成则继续等待，
+        已中断/失败则由会话状态检查立即结束。"""
+        self._open_thread(cookies, session_id, expires, account_id)
         att = self._wait_attachment("", timeout, expect, on_progress=on_progress,
                                     stop_event=stop_event)
         if not att:
