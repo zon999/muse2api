@@ -1593,7 +1593,7 @@ class MuseEngine:
         t_sent = time.time()
         deadline = t_sent + timeout
         first_token_deadline = min(deadline, t_sent + 40.0)
-        sent, last, stable = "", None, 0
+        sent, last, stable, bubble = "", "", 0, 0
         got_first = False
 
         # 1. 等待助手生成并开始吐字（高频 60ms 采样，捕获到首批增量文字瞬间 yield 出去）
@@ -1602,6 +1602,9 @@ class MuseEngine:
                 return
             time.sleep(0.06)
             cnt, cur, has_stop = self._poll_chat()
+            if has_stop:
+                # The agent is working (running tools) before it writes; give it the whole request timeout.
+                first_token_deadline = deadline
             if not cur or (cnt <= base_agent and cur == base_text):
                 if time.time() - t_sent > 14.0:
                     try:
@@ -1612,18 +1615,18 @@ class MuseEngine:
                         raise MuseGenerationError("云端 VM 连接超时 (Still sending)")
                 continue
 
-            delta = cur[len(sent):] if cur.startswith(sent) else cur
-            if delta:
-                sent = cur
-                yield delta
-                last = cur
+            ready = self._settled_chat_text(cur)
+            if ready:
+                sent, last, bubble = ready, cur, cnt
+                yield ready
                 got_first = True
                 break
 
         if not got_first:
             raise MuseGenerationError("等待助手首字响应超时")
 
-        # 2. 持续捕获增量文本
+        # 2. 持续捕获增量文本。Only text past what was already sent is emitted, so a bubble that re-renders its
+        # own text (a list marker turning into the finished item) never repeats the reply.
         while time.time() < deadline:
             if stop_event is not None and stop_event.is_set():
                 return
@@ -1632,22 +1635,38 @@ class MuseEngine:
             if not cur:
                 continue
 
+            if cnt > bubble and not cur.startswith(sent):
+                # A new agent bubble: finish the previous one, including any line held back, then start fresh.
+                done = self._settled_chat_text(last)
+                yield done[len(sent):] + ("\n" if done.endswith("\n") else "\n\n")
+                sent, last = "", ""
+            bubble = max(bubble, cnt)
             if cur != last:
-                delta = cur[len(sent):] if cur.startswith(sent) else cur
-                if delta:
-                    sent = cur
-                    yield delta
+                ready = self._settled_chat_text(cur)
+                if len(ready) > len(sent):
+                    yield ready[len(sent):]
+                    sent = ready
                 last, stable = cur, 0
             else:
                 stable += 1
                 # Stop 按钮消失说明前端生成彻底结束，连续 3 次（约 0.18s）无新文本即正常退出
-                if not has_stop and stable >= 3:
-                    return
                 # Stop 按钮仍在时绝不过早截断（模型思考、代码块或网络抖动），允许等待至 stable >= 80（约 5s）防卡死
-                if has_stop and stable >= 80:
+                if (not has_stop and stable >= 3) or (has_stop and stable >= 80):
+                    if len(cur) > len(sent):
+                        yield cur[len(sent):]
                     return
 
         raise MuseGenerationError("等待助手回复超时")
+
+    @staticmethod
+    def _settled_chat_text(text: str) -> str:
+        """Text that is safe to stream: drops a last line that is only a markdown marker the page is still rendering
+        (Muse shows "-" plus a zero-width space, then replaces it with the finished list item)."""
+        head, sep, tail = text.rpartition("\n")
+        marker = tail.replace("​", "").strip()
+        if "​" in tail or marker in ("-", "*", "+", ">") or re.fullmatch(r"#+|\d+[.)]", marker):
+            return head + sep
+        return text
 
     def chat(self, cookies: dict, prompt: str, expires: dict | None = None,
              timeout: int | None = None, account_id: str | None = None) -> str:
