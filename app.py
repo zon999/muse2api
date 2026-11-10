@@ -389,7 +389,8 @@ def _renew_and_persist(acc_id: str, wake_vm: bool = True, force: bool = False) -
 
 
 def safe_chat_stream(cookies: dict, prompt: str, expires: dict | None,
-                     timeout: int, account_id: str | None):
+                     timeout: int, account_id: str | None, pinned: bool = False, detach: bool = False,
+                     on_session=None):
     """在独立线程中执行 chat_stream 并持有 GEN_LOCK，通过 Queue 往外吐。
     无论下游客户端何时断连、异常或超时，stop_event + finally 块保证 100% 立即释放 GEN_LOCK，绝不死锁。
     若首字前遇到单账号 VM 卡死或会话异常，自动切换下一个健康账号重试一次。"""
@@ -404,7 +405,8 @@ def safe_chat_stream(cookies: dict, prompt: str, expires: dict | None,
         last_exc = None
         leased_id = None
         try:
-            for attempt in range(2):
+            # A pinned account never fails over: the caller needs that account's workspace.
+            for attempt in range(1 if pinned else 2):
                 if stop_event.is_set():
                     return
                 if attempt > 0:
@@ -441,7 +443,7 @@ def safe_chat_stream(cookies: dict, prompt: str, expires: dict | None,
                         engine.start()
                         for chunk in engine.chat_stream(
                             cur_cookies, prompt, cur_exp, timeout,
-                            account_id=cur_id, stop_event=stop_event
+                            account_id=cur_id, stop_event=stop_event, detach=detach, on_session=on_session
                         ):
                             yielded = True
                             q.put(("data", chunk))
@@ -525,6 +527,8 @@ class VideoRequest(BaseModel):
     image_url: Any = None
     reference_image: str | None = None
     reference_images: list | None = None
+    # Muse Studio extension: run on this account only (the files it refers to live in that account's workspace)
+    account_id: str | None = None
 
 
 class ChatMessage(BaseModel):
@@ -548,6 +552,10 @@ class ChatRequest(BaseModel):
     max_tokens: int | None = None
     timeout: int | None = None
     prompt: str | None = None       # 兼容把 prompt 直接放顶层的客户端
+    # Muse Studio extension: run on this account only (its files live in that account's workspace)
+    account_id: str | None = None
+    # Muse Studio extension: return once the agent has started instead of waiting for its reply
+    detach: bool = False
     # 下面这些声明出来只是为了「能读到」，muse.ai 端不做对应处理
     tools: list | None = None
     tool_choice: object | None = None
@@ -1133,7 +1141,8 @@ def _run_generation_locked(prompt: str, kind: str, timeout: int,
             if deadline is not None and time.monotonic() >= deadline:
                 raise MuseGenerationError("任务总等待时限已到，停止重试")
             if attempt > 0:
-                if isinstance(last_exc, MuseModelRefusalError):
+                if isinstance(last_exc, MuseModelRefusalError) or account_id:
+                    # A pinned account never fails over: the caller needs that account's workspace.
                     break
                 # 会话被人为中断（在 Muse 里点了停止）或任务已取消时不换号重试
                 if isinstance(last_exc, MuseSessionStopped) and last_exc.status in ("interrupted", "cancelled"):
@@ -1552,7 +1561,7 @@ async def create_video(req: VideoRequest, idempotency_key: str | None = Header(d
         try:
             def prog_cb(p):
                 store.update_task(task["id"], progress=p)
-            res, acc_id = _run_generation(prompt, "video", timeout, on_progress=prog_cb,
+            res, acc_id = _run_generation(prompt, "video", timeout, account_id=req.account_id, on_progress=prog_cb,
                                           reference_images=ref_images, on_acquired=_on_acquired,
                                           stop_event=stop_event, on_session=_record_session(task["id"]))
             _finish_task_success(task["id"], "video", res, acc_id, timing["t0"])
@@ -1662,9 +1671,15 @@ async def chat_completions(req: ChatRequest, _=Depends(auth)):
 
     model = resolve_model(req.model, default="muse-spark")
     timeout = int(req.timeout or CFG.chat_timeout)
-    acc = store.pick_account(rotate=True, preferred_id=getattr(engine, "current_acc_id", None))
+    if req.account_id:
+        acc = store.get_account(req.account_id)
+        if not acc or not acc.get("enabled", True) or not acc.get("cookies"):
+            raise HTTPException(400, f"账号不可用: {req.account_id}")
+    else:
+        acc = store.pick_account(rotate=True, preferred_id=getattr(engine, "current_acc_id", None))
     if not acc:
         raise HTTPException(400, "没有可用账号，请先在管理页面导入 cookie")
+    pinned = bool(req.account_id)
 
     cid = "chatcmpl-" + uuid.uuid4().hex[:24]
     created = int(time.time())
@@ -1687,7 +1702,7 @@ async def chat_completions(req: ChatRequest, _=Depends(auth)):
                 # 握手建立瞬间立即发送 role: assistant 首包，让下游客户端秒级捕获光标
                 yield _sse(_chat_chunk(cid, created, model, {"role": "assistant"}))
 
-                stream_gen = safe_chat_stream(cookies, prompt, expires, timeout, account_id=acc_id)
+                stream_gen = safe_chat_stream(cookies, prompt, expires, timeout, account_id=acc_id, pinned=pinned, detach=req.detach)
                 if not tool_note:
                     for chunk in stream_gen:
                         for piece in _pace_text(chunk):
@@ -1748,8 +1763,11 @@ async def chat_completions(req: ChatRequest, _=Depends(auth)):
                 yield _sse({"error": {"message": f"内部错误: {exc}", "type": "server_error", "code": 500}})
         return StreamingResponse(sync_stream(), media_type="text/event-stream", headers=_SSE_HEADERS)
 
+    detached: dict = {}
+
     def run() -> str:
-        return "".join(safe_chat_stream(cookies, prompt, expires, timeout, account_id=acc_id))
+        return "".join(safe_chat_stream(cookies, prompt, expires, timeout, account_id=acc_id, pinned=pinned,
+                                        detach=req.detach, on_session=lambda sid: detached.update(muse_session=sid)))
 
     try:
         text = await asyncio.to_thread(run)
@@ -1773,7 +1791,7 @@ async def chat_completions(req: ChatRequest, _=Depends(auth)):
             "model": model,
             "choices": [{"index": 0, "finish_reason": "stop",
                          "message": {"role": "assistant", "content": text}}],
-            "usage": usage}
+            "usage": usage, **detached}
 
 
 def _responses_messages(req: ResponsesRequest) -> list[ChatMessage]:

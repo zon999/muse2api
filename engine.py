@@ -1582,8 +1582,13 @@ class MuseEngine:
 
     def chat_stream(self, cookies: dict, prompt: str, expires: dict | None = None,
                     timeout: int | None = None, account_id: str | None = None,
-                    stop_event=None):
-        """发一条消息，流式 yield 增量文本。"""
+                    stop_event=None, detach: bool = False, on_session=None):
+        """发一条消息，流式 yield 增量文本。
+
+        detach: return once Muse has accepted the message (its thread is listed by the gateway, or the first text
+        arrived) instead of waiting for the reply, so a long agent job keeps running in Muse without holding the
+        engine's chat lock. The Stop button alone is not enough: it also shows for a message the gateway never
+        acknowledged, and leaving the page then loses the message. on_session receives the thread id on detach."""
         timeout = int(timeout or getattr(self.cfg, "chat_timeout", 300))
         self.ensure_page(cookies, expires, account_id=account_id)
         self.reset_thread(for_chat=True)
@@ -1595,6 +1600,7 @@ class MuseEngine:
         first_token_deadline = min(deadline, t_sent + 40.0)
         sent, last, stable, bubble = "", "", 0, 0
         got_first = False
+        next_accept_check = t_sent
 
         # 1. 等待助手生成并开始吐字（高频 60ms 采样，捕获到首批增量文字瞬间 yield 出去）
         while time.time() < first_token_deadline:
@@ -1602,6 +1608,10 @@ class MuseEngine:
                 return
             time.sleep(0.06)
             cnt, cur, has_stop = self._poll_chat()
+            if detach and has_stop and time.time() >= next_accept_check:
+                next_accept_check = time.time() + 1.5
+                if self._detach_accepted(on_session):
+                    return
             if has_stop:
                 # The agent is working (running tools) before it writes; give it the whole request timeout.
                 first_token_deadline = deadline
@@ -1619,6 +1629,11 @@ class MuseEngine:
             if ready:
                 sent, last, bubble = ready, cur, cnt
                 yield ready
+                if detach:
+                    tid = self._thread_id()
+                    if tid and on_session is not None:
+                        on_session(tid)
+                    return
                 got_first = True
                 break
 
@@ -1657,6 +1672,18 @@ class MuseEngine:
                     return
 
         raise MuseGenerationError("等待助手回复超时")
+
+    def _detach_accepted(self, on_session=None) -> bool:
+        """True once the page has a thread id that the gateway lists with a live status: Muse has the message."""
+        tid = self._thread_id()
+        if not tid:
+            return False
+        status = self._muse_session_status()
+        if not status or status in self.STOPPED_SESSION_STATUSES:
+            return False
+        if on_session is not None:
+            on_session(tid)
+        return True
 
     @staticmethod
     def _settled_chat_text(text: str) -> str:
