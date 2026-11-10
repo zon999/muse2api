@@ -15,7 +15,7 @@ engine_module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(engine_module)
 
 
-def stopping_engine(statuses, button="clicked"):
+def stopping_engine(statuses, cancelled=True):
     """An engine whose page opens any thread and whose gateway reports `statuses` in turn."""
     clock = SimpleNamespace(now=0.0)
     engine_module.time = SimpleNamespace(time=lambda: clock.now,
@@ -26,11 +26,11 @@ def stopping_engine(statuses, button="clicked"):
     seq = iter(statuses)
     last = [statuses[-1] if statuses else ""]
     engine._muse_session_status = lambda: next(seq, last[0])
-    engine.stop_generation = lambda: clicks.append(1) or button
+    engine._gateway_cancel = lambda sid: clicks.append(sid) or cancelled
     return engine, opened, clicks
 
 
-def test_stop_clicks_stop_and_waits_for_interrupted():
+def test_stop_cancels_and_waits_for_interrupted():
     engine, opened, clicks = stopping_engine(["running", "running", "running", "interrupted"])
     assert engine.stop_session({}, "thread-abc123", account_id="acc1") == ("interrupted", True)
     assert opened == [("thread-abc123", "acc1")] and len(clicks) == 1
@@ -43,7 +43,7 @@ def test_stop_on_finished_thread_does_nothing():
 
 
 def test_stop_without_running_agent_reports_not_stopped():
-    engine, _, clicks = stopping_engine(["idle"], button="no-button")
+    engine, _, clicks = stopping_engine(["idle"], cancelled=False)
     assert engine.stop_session({}, "thread-abc123") == ("idle", False)
     assert len(clicks) == 1
 

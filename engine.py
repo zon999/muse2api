@@ -2098,9 +2098,24 @@ class MuseEngine:
             raise MuseGenerationError("无法打开原 Muse 会话")
         self._wait_ws_ready(self.page, timeout=12.0)
 
+    _CANCEL_JS = r"""(async function(sid){
+      var snap = window.__hatchEarlyGatewayRuntimeState && window.__hatchEarlyGatewayRuntimeState.activeRuntime
+        && window.__hatchEarlyGatewayRuntimeState.activeRuntime.getSnapshot();
+      if (!snap || typeof snap.sendRequest !== 'function') return false;
+      var r = await snap.sendRequest('chat.cancel', {session_id: sid});
+      return !!(r && r.cancelled);
+    })(%s)"""
+
+    def _gateway_cancel(self, session_id: str) -> bool:
+        """Asks the Muse gateway to cancel the thread's running turn; False when nothing was cancelled."""
+        try:
+            return bool(self.page.js(self._CANCEL_JS % json.dumps(session_id), await_promise=True, timeout=15))
+        except Exception:  # noqa: BLE001
+            return False
+
     def stop_session(self, cookies: dict, session_id: str, expires: dict | None = None,
                      account_id: str | None = None, wait: float = 15.0) -> tuple[str, bool]:
-        """Stops a detached agent thread: opens it and clicks Stop.
+        """Stops a detached agent thread: opens it and cancels its running turn through the gateway.
 
         Returns (status, stopped): stopped is False when the thread had already ended (nothing to stop).
         Raises MuseSessionNotFound when the gateway does not list the thread for this account."""
@@ -2110,7 +2125,9 @@ class MuseEngine:
             raise MuseSessionNotFound(session_id)
         if status in self.STOPPED_SESSION_STATUSES:
             return status, False
-        if self.stop_generation() != "clicked":
+        # A reopened thread does not show the Stop button while the agent runs tools, so ask the gateway directly,
+        # as Muse's own Stop does.
+        if not self._gateway_cancel(session_id):
             return status, False
         t_end = time.time() + wait
         while time.time() < t_end:
